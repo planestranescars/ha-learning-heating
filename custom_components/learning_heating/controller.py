@@ -62,6 +62,20 @@ BAD_STATES = (STATE_UNAVAILABLE, STATE_UNKNOWN)
 REASON_VALVE_OFF = "valve switched off by hand"
 
 
+def _round_target(value: float) -> float:
+    return max(MIN_TARGET, min(MAX_TARGET, round(value * 2) / 2))
+
+
+def _when(at: datetime) -> str:
+    at = dt_util.as_local(at)
+    days = (at.date() - dt_util.now().date()).days
+    if days == 0:
+        return f"{at:%H:%M}"
+    if days == 1:
+        return f"tomorrow {at:%H:%M}"
+    return f"{at:%a %H:%M}"
+
+
 def _float(value: Any) -> float | None:
     try:
         return float(value)
@@ -90,9 +104,32 @@ class Room:
         self.last_write: tuple[float, datetime] | None = None
         self.recent_writes: list[tuple[float, datetime]] = []
         self.resume_requested = False
+        self.event_at: datetime | None = None
         self.comfort: dict[str, float] = {}
         self.extra_lead = 0.0
         self.feedback_log: list[dict[str, Any]] = []
+
+    @property
+    def summary(self) -> str:
+        """What the room is doing, in plain words."""
+        if self.reason == REASON_VALVE_OFF:
+            return "Switched off at the radiator"
+        if self.target is None or self.reason == "starting":
+            return "Starting up"
+        temp = f"{self.target:g}°"
+        if self.override_until is not None:
+            return f"Set by hand to {temp} until {_when(self.override_until)}"
+        if self.reason == "unoccupied":
+            return f"Not in use, kept at {temp}"
+        if self.reason == "warm outside":
+            return f"Mild outside, so eased off to {temp}"
+        if self.reason.startswith("pre-heating") and self.event_at:
+            return f"Warming up to {temp} for {_when(self.event_at)}"
+        if self.reason.startswith("coasting") and self.event_at:
+            return f"Easing off to {temp}; it'll stay warm until {_when(self.event_at)}"
+        if self.next_change is not None:
+            return f"Keeping {temp} until {_when(self.next_change)}"
+        return f"Keeping {temp}"
 
     @property
     def held(self) -> bool:
@@ -366,7 +403,7 @@ class HeatingController:
         else:
             target, reason = self._plan(room, now, base, upcoming)
 
-        room.target = max(MIN_TARGET, min(MAX_TARGET, round(target * 2) / 2))
+        room.target = _round_target(target)
         room.reason = reason
 
     def _plan(
@@ -376,6 +413,7 @@ class HeatingController:
         outdoor_at = self._outdoor_fn(now)
         horizon = now + timedelta(hours=self.max_preheat + room.extra_lead)
         target, reason = base, "schedule"
+        room.event_at = None
 
         for at, temp in upcoming:
             if at > horizon or temp < base:
@@ -394,6 +432,7 @@ class HeatingController:
                 room.lead_hours = lead
             if now >= at - timedelta(hours=lead):
                 target, reason = temp, f"pre-heating for {at:%H:%M}"
+                room.event_at = at
 
         if reason == "schedule" and learner.reliable and upcoming:
             at, temp = upcoming[0]
@@ -402,6 +441,7 @@ class HeatingController:
                 predicted = learner.predict(hours, 0.0, outdoor_at)
                 if predicted is not None and predicted >= base - COAST_TOLERANCE:
                     target, reason = temp, f"coasting to {at:%H:%M}"
+                    room.event_at = at
         return target, reason
 
     async def _async_tick(self, _now: datetime | None = None) -> None:
@@ -440,6 +480,10 @@ class HeatingController:
             return
         if not resume and room.last_write and room.last_write[0] == room.target and now - room.last_write[1] < WRITE_RETRY:
             return
+        await self._async_write(room, state, now)
+
+    async def _async_write(self, room: Room, state: State, now: datetime) -> None:
+        current = _float(state.attributes.get(ATTR_TEMPERATURE))
         room.last_write = (room.target, now)
         room.recent_writes.append(room.last_write)
         self._written[room.slug] = room.target
@@ -462,13 +506,14 @@ class HeatingController:
     # ---- comfort feedback -----------------------------------------------
 
     async def async_feedback(
-        self, room: Room, feeling: str, when: datetime | None = None
+        self, room: Room, feeling: str, when: datetime | None = None, nudge: float = 0.0
     ) -> dict[str, Any]:
         """Learn from 'too hot' / 'too cold' at a moment, now or in the last two days.
 
         Too cold while the room was still short of its target means heating started too
         late, so the room's warm-up lead grows. Otherwise the target for that part of the
-        day was wrong and is nudged by 0.5C.
+        day was wrong and is nudged by 0.5C. A non-zero `nudge` also moves the room by
+        that much straight away, held until its next schedule change.
         """
         now = dt_util.now()
         if when is None:
@@ -511,11 +556,31 @@ class HeatingController:
             "period": period,
             "action": action,
         }
+        await self.async_tick()
+        if nudge and room.target is not None:
+            held_at = room.target + (nudge if feeling == "too_cold" else -nudge)
+            await self._async_hold(room, held_at)
+            entry["action"] = action = (
+                f"{action}; set to {room.target:g}°C until {_when(room.override_until)}"
+            )
         room.feedback_log = (room.feedback_log + [entry])[-FEEDBACK_LOG_SIZE:]
         _LOGGER.info("%s feedback %s at %s: %s", room.name, feeling, entry["time"], action)
         await self._async_save()
-        await self.async_tick()
+        async_dispatcher_send(self.hass, SIGNAL_UPDATE)
         return entry
+
+    async def _async_hold(self, room: Room, temp: float) -> None:
+        """Hold a room at a temperature until its next schedule change, as a manual change would."""
+        async with self._lock:
+            now = dt_util.now()
+            upcoming = [at for at, _ in self.timeline(room, now) if at > now]
+            room.override_until = upcoming[0] if upcoming else now + OVERRIDE_FALLBACK
+            room.target = _round_target(temp)
+            room.reason = "manual override"
+            state = self.hass.states.get(room.climate)
+            if self.enabled and state is not None and state.state not in BAD_STATES:
+                self._unchecked.discard(room.slug)
+                await self._async_write(room, state, now)
 
     async def async_resume(self, room: Room) -> None:
         """Drop a manual override (or hand-set Off) and go back to the plan now."""

@@ -41,7 +41,7 @@ Per room:
 
 | Entity | Purpose |
 |---|---|
-| `sensor.<room>_heating_target` | Target being applied, with the reason, next change, pre-heat lead and feedback adjustments as attributes |
+| `sensor.<room>_heating_target` | Target being applied, with a plain-English `summary` (e.g. "Warming up to 21° for 06:30"), the reason, next change, pre-heat lead and feedback adjustments as attributes |
 | `sensor.<room>_temperature` | Last reported temperature (kept in long-term statistics) |
 | `sensor.<room>_warm_up_rate` | Learnt warm-up rate in °C/h, with heat loss, gains, radiator lag and prediction error as attributes |
 | `switch.<room>_occupied` | Off holds the room at its setback temperature |
@@ -53,8 +53,9 @@ last setting).
 
 ## Services
 
-- `learning_heating.feedback`: `room`, `feeling` (`too_hot` / `too_cold`) and optional
-  `when` (any time in the last two days). Returns what was changed.
+- `learning_heating.feedback`: `room`, `feeling` (`too_hot` / `too_cold`), optional
+  `when` (any time in the last two days) and optional `nudge` (°C) to also warm or cool
+  the room straight away until its next schedule change. Returns what was changed.
 - `learning_heating.resume`: `room`. Ends a manual change, or a valve switched off by
   hand, and returns the room to its plan straight away.
 - `learning_heating.reset_feedback`: `room`. Forgets that room's feedback adjustments.

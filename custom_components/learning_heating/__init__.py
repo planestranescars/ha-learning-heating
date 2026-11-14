@@ -70,7 +70,9 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         return controller.rooms[slug]
 
     async def feedback(call: ServiceCall) -> ServiceResponse:
-        entry = await controller.async_feedback(room_for(call), call.data["feeling"], call.data.get("when"))
+        entry = await controller.async_feedback(
+            room_for(call), call.data["feeling"], call.data.get("when"), call.data["nudge"]
+        )
         return entry if call.return_response else None
 
     async def reset_feedback(call: ServiceCall) -> None:
@@ -85,6 +87,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
             vol.Required("room"): cv.string,
             vol.Required("feeling"): vol.In(["too_hot", "too_cold"]),
             vol.Optional("when"): cv.datetime,
+            vol.Optional("nudge", default=0.0): vol.All(vol.Coerce(float), vol.Range(min=0, max=3)),
         }),
         supports_response=SupportsResponse.OPTIONAL,
     )

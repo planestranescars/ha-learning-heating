@@ -62,6 +62,7 @@ class TargetSensor(_RoomSensor):
         room = self.room
         estimate = room.learner.estimate
         return {
+            "summary": room.summary,
             "reason": room.reason,
             "occupied": room.occupied,
             "next_change": room.next_change.isoformat() if room.next_change else None,
