@@ -46,6 +46,7 @@ Per room:
 | `sensor.<room>_warm_up_rate` | Learnt warm-up rate in °C/h, with heat loss, gains, radiator lag and prediction error as attributes |
 | `switch.<room>_occupied` | Off holds the room at its setback temperature |
 | `button.<room>_too_hot` / `button.<room>_too_cold` | Comfort feedback for right now |
+| `button.<room>_resume_schedule` | Ends a manual change; only available while the room is held by one |
 
 Plus `switch.learning_heating_control`: off stops all valve writes (valves keep their
 last setting).
@@ -54,7 +55,18 @@ last setting).
 
 - `learning_heating.feedback`: `room`, `feeling` (`too_hot` / `too_cold`) and optional
   `when` (any time in the last two days). Returns what was changed.
+- `learning_heating.resume`: `room`. Ends a manual change, or a valve switched off by
+  hand, and returns the room to its plan straight away.
 - `learning_heating.reset_feedback`: `room`. Forgets that room's feedback adjustments.
+
+## Manual changes
+
+Any change to a valve's target that the controller didn't make (the knob, the app,
+another automation) holds that room until its next schedule change, or 4 hours if it
+has none. A valve switched to Off by hand stays off. While held, the room keeps
+learning but its valve isn't touched, ahead of occupancy and warm-weather rules.
+Press the room's **resume schedule** button (or call `learning_heating.resume`) to
+end it early.
 
 ## The model
 

@@ -59,6 +59,7 @@ BEHIND_TARGET = 0.5
 FEEDBACK_LOG_SIZE = 20
 FEEDBACK_MAX_AGE = timedelta(days=2)
 BAD_STATES = (STATE_UNAVAILABLE, STATE_UNKNOWN)
+REASON_VALVE_OFF = "valve switched off by hand"
 
 
 def _float(value: Any) -> float | None:
@@ -88,9 +89,15 @@ class Room:
         self.override_until: datetime | None = None
         self.last_write: tuple[float, datetime] | None = None
         self.recent_writes: list[tuple[float, datetime]] = []
+        self.resume_requested = False
         self.comfort: dict[str, float] = {}
         self.extra_lead = 0.0
         self.feedback_log: list[dict[str, Any]] = []
+
+    @property
+    def held(self) -> bool:
+        """Overridden by hand, or its valve switched off by hand."""
+        return self.override_until is not None or self.reason == REASON_VALVE_OFF
 
     def comfort_as_dict(self) -> dict[str, Any]:
         return {"offsets": self.comfort, "extra_lead": self.extra_lead, "log": self.feedback_log}
@@ -419,15 +426,19 @@ class HeatingController:
         state = self.hass.states.get(room.climate)
         if state is None or state.state in BAD_STATES:
             return
-        if state.state == HVACMode.OFF:
-            room.reason = "valve switched off by hand"
+        resume = room.resume_requested
+        room.resume_requested = False
+        if state.state == HVACMode.OFF and not resume:
+            room.reason = REASON_VALVE_OFF
             return
-        if room.slug in self._unchecked and self._adopt_change_made_while_stopped(room, state, now):
+        if resume:
+            self._unchecked.discard(room.slug)
+        elif room.slug in self._unchecked and self._adopt_change_made_while_stopped(room, state, now):
             return
         current = _float(state.attributes.get(ATTR_TEMPERATURE))
         if state.state == HVACMode.HEAT and current is not None and abs(current - room.target) < 0.25:
             return
-        if room.last_write and room.last_write[0] == room.target and now - room.last_write[1] < WRITE_RETRY:
+        if not resume and room.last_write and room.last_write[0] == room.target and now - room.last_write[1] < WRITE_RETRY:
             return
         room.last_write = (room.target, now)
         room.recent_writes.append(room.last_write)
@@ -505,6 +516,13 @@ class HeatingController:
         await self._async_save()
         await self.async_tick()
         return entry
+
+    async def async_resume(self, room: Room) -> None:
+        """Drop a manual override (or hand-set Off) and go back to the plan now."""
+        room.override_until = None
+        room.resume_requested = True
+        _LOGGER.info("%s resumed its schedule", room.name)
+        await self.async_tick()
 
     async def async_reset_feedback(self, room: Room) -> None:
         room.comfort = {}

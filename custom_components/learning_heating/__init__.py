@@ -76,6 +76,9 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     async def reset_feedback(call: ServiceCall) -> None:
         await controller.async_reset_feedback(room_for(call))
 
+    async def resume(call: ServiceCall) -> None:
+        await controller.async_resume(room_for(call))
+
     hass.services.async_register(
         DOMAIN, "feedback", feedback,
         schema=vol.Schema({
@@ -85,8 +88,8 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         }),
         supports_response=SupportsResponse.OPTIONAL,
     )
-    hass.services.async_register(
-        DOMAIN, "reset_feedback", reset_feedback, schema=vol.Schema({vol.Required("room"): cv.string})
-    )
+    room_schema = vol.Schema({vol.Required("room"): cv.string})
+    hass.services.async_register(DOMAIN, "reset_feedback", reset_feedback, schema=room_schema)
+    hass.services.async_register(DOMAIN, "resume", resume, schema=room_schema)
     controller.async_start()
     return True

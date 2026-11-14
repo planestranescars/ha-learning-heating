@@ -26,6 +26,19 @@ feedback:
       selector:
         datetime:
 
+resume:
+  name: Resume schedule
+  description: >-
+    End a manual change to a room (or a valve switched off by hand) and go back to
+    the room's plan straight away.
+  fields:
+    room:
+      name: Room
+      required: true
+      example: lounge
+      selector:
+        text:
+
 reset_feedback:
   name: Reset comfort feedback
   description: Forget everything a room has learnt from feedback.
