@@ -1,0 +1,11 @@
+{
+  "domain": "learning_heating",
+  "name": "Learning Heating",
+  "codeowners": ["@planestranescars"],
+  "dependencies": ["recorder"],
+  "documentation": "https://github.com/planestranescars/ha-learning-heating",
+  "issue_tracker": "https://github.com/planestranescars/ha-learning-heating/issues",
+  "iot_class": "calculated",
+  "requirements": [],
+  "version": "0.2.0"
+}

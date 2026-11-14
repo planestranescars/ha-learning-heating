@@ -1,0 +1,39 @@
+# Example configuration. Include it from configuration.yaml with:
+#   learning_heating: !include learning_heating.yaml
+#
+# Schedule keys must be quoted: "HH:MM", "sunrise" or "sunset", optionally with an
+# offset such as "sunset-01:00". Each entry is the target temperature from that time on.
+
+weather: weather.home            # needs hourly forecasts (e.g. Met.no)
+setback: 14                      # used when a room's "occupied" switch is off
+warm_cutoff: 16                  # above this outdoor mean, rooms drop to setback
+max_preheat_hours: 3
+history_days: 10                 # history replayed on first start
+
+# Binary sensors that are on while each boiler zone is circulating hot water.
+zones:
+  house: binary_sensor.heating_house
+  annexe: binary_sensor.heating_annexe
+
+rooms:
+  lounge:
+    name: Lounge
+    climate: climate.lounge_trv
+    valve: sensor.lounge_trv_valve   # valve opening in %
+    zone: house
+    schedule:
+      "06:30": 20
+      "08:30": 17
+      "sunset-01:00": 20
+      "22:00": 15
+
+  spare_bedroom:
+    name: Spare bedroom
+    climate: climate.spare_bedroom_trv
+    valve: sensor.spare_bedroom_trv_valve
+    zone: annexe
+    occupied: false
+    setback: 12
+    schedule:
+      "06:30": 19
+      "22:00": 16

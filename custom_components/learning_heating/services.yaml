@@ -1,0 +1,38 @@
+feedback:
+  name: Comfort feedback
+  description: >-
+    Say a room was too hot or too cold, now or at a time in the last two days.
+    Too cold while the room was still short of its target makes it start heating
+    earlier; otherwise the target for that part of the day moves by 0.5°C.
+  fields:
+    room:
+      name: Room
+      description: Room key from learning_heating.yaml, e.g. lounge or spare_bedroom.
+      required: true
+      example: kitchen
+      selector:
+        text:
+    feeling:
+      name: Feeling
+      required: true
+      selector:
+        select:
+          options:
+            - too_hot
+            - too_cold
+    when:
+      name: When
+      description: Leave empty for now.
+      selector:
+        datetime:
+
+reset_feedback:
+  name: Reset comfort feedback
+  description: Forget everything a room has learnt from feedback.
+  fields:
+    room:
+      name: Room
+      required: true
+      example: kitchen
+      selector:
+        text:

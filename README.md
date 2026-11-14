@@ -1,0 +1,69 @@
+# Learning Heating
+
+A Home Assistant custom integration that runs room schedules on radiator valves (TRVs)
+and learns how each room behaves, so rooms are warm when you need them and the boiler
+runs less when you don't.
+
+Built for eQ-3 MAX! valves on a zoned boiler, but it works with any `climate` entity
+that takes a target temperature plus a sensor reporting the valve opening.
+
+## What it does
+
+- **Learns each room** from its temperature reports: how fast it warms with the valve
+  open, how fast it loses heat to outside, steady gains (sun, people, cooking) and how
+  long the radiator takes to respond. Works with sparse, irregular reports.
+- **Starts heating early** so each room reaches its next target on time, using the
+  hourly weather forecast. Learnt timing is only used for a room once its predictions
+  beat "the temperature won't change"; until then a fixed one-hour lead is used.
+- **Coasts** into lower targets when the room will stay warm enough without heat.
+- **Warm-weather cut-off**: rooms drop to setback when the outdoor forecast is mild.
+- **Respects manual changes** made at the valve or in Home Assistant until the room's
+  next schedule change, including changes made while Home Assistant was restarting.
+- **Comfort feedback**: "too hot" / "too cold" buttons and a service. Too cold while the
+  room was still short of its target makes it start earlier; otherwise the target for
+  that part of the day moves by 0.5 °C.
+
+## Install
+
+1. In HACS, add this repository as a custom repository (category: Integration) and
+   download **Learning Heating**.
+2. Copy [`examples/learning_heating.yaml`](examples/learning_heating.yaml) to your
+   config folder, edit it for your rooms, and add to `configuration.yaml`:
+   ```yaml
+   learning_heating: !include learning_heating.yaml
+   ```
+3. Restart Home Assistant. Valves are switched to manual (`heat`) mode so their own
+   built-in schedules don't interfere.
+
+## Entities
+
+Per room:
+
+| Entity | Purpose |
+|---|---|
+| `sensor.<room>_heating_target` | Target being applied, with the reason, next change, pre-heat lead and feedback adjustments as attributes |
+| `sensor.<room>_temperature` | Last reported temperature (kept in long-term statistics) |
+| `sensor.<room>_warm_up_rate` | Learnt warm-up rate in °C/h, with heat loss, gains, radiator lag and prediction error as attributes |
+| `switch.<room>_occupied` | Off holds the room at its setback temperature |
+| `button.<room>_too_hot` / `button.<room>_too_cold` | Comfort feedback for right now |
+
+Plus `switch.learning_heating_control`: off stops all valve writes (valves keep their
+last setting).
+
+## Services
+
+- `learning_heating.feedback`: `room`, `feeling` (`too_hot` / `too_cold`) and optional
+  `when` (any time in the last two days). Returns what was changed.
+- `learning_heating.reset_feedback`: `room`. Forgets that room's feedback adjustments.
+
+## The model
+
+```
+dR/dt = (u - R) / tau                 radiator warmth, lagging the valve
+dT/dt = a * R - k * (T - T_out) + g   room temperature
+```
+
+`u` is the valve opening (zero while the zone isn't circulating). Integrating between
+two temperature reports gives one linear sample in `a`, `k` and `g`, fitted by
+recursive least squares; three radiator lags are learnt side by side and the
+best-predicting one is used. Models are saved in `.storage/learning_heating.models`.
