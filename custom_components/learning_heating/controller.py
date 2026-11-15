@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from datetime import datetime, timedelta
 from functools import partial
 from typing import Any
@@ -55,6 +56,7 @@ DEFAULT_OUTDOOR = 8.0
 MIN_TARGET, MAX_TARGET = 5.0, 30.0
 COMFORT_STEP = 0.5
 COMFORT_LIMIT = 3.0
+MAX_FEEDBACK_JUMP = 1.5
 LEAD_STEP_H = 0.5
 MAX_EXTRA_LEAD_H = 3.0
 BEHIND_TARGET = 0.5
@@ -526,6 +528,14 @@ class HeatingController:
         past = [key for at, _, key in sorted(points) if at <= when]
         return past[-1] if past else None
 
+    def _scheduled_at(self, room: Room, when: datetime) -> float | None:
+        """The scheduled temperature at a moment, with what feedback has already changed."""
+        points: list[tuple[datetime, float, str]] = []
+        for offset in (-1, 0):
+            points += points_for_day(self.hass, when.date() + timedelta(days=offset), room.schedule)
+        past = [(temp, key) for at, temp, key in sorted(points) if at <= when]
+        return past[-1][0] + room.comfort.get(past[-1][1], 0.0) if past else None
+
     def _warmer_period_before(self, room: Room, when: datetime) -> str | None:
         """The most recent earlier schedule entry that was warmer than the one in force at `when`."""
         points: list[tuple[datetime, float, str]] = []
@@ -782,8 +792,10 @@ class HeatingController:
         late, so the room's warm-up lead grows. Too hot while the room was already well
         above its target means the heat was left over from an earlier, warmer part of the
         day, so that part is lowered. Otherwise the target for that part of the day was
-        wrong and is nudged by 0.5C. A second press within a few minutes of the first is
-        not learnt twice. A non-zero `nudge` also moves the room by that much straight
+        wrong and moves by 0.5C, or by up to 1.5C where that is what it takes to put the
+        target on the right side of the temperature the room was at: a room that feels
+        cold at 17.3C is not helped by a target of 17. A second press within a few minutes
+        of the first is not learnt twice. A non-zero `nudge` also moves the room by that much straight
         away, held until its next schedule change.
         """
         now = dt_util.now()
@@ -809,6 +821,11 @@ class HeatingController:
         if leftover is not None:
             period = leftover
         offset = room.comfort.get(period, 0.0)
+        step = COMFORT_STEP
+        scheduled = self._scheduled_at(room, when)
+        if leftover is None and temp is not None and scheduled is not None:
+            gap = temp - scheduled if feeling == "too_cold" else scheduled - temp
+            step = max(step, min(MAX_FEEDBACK_JUMP, math.ceil((gap + COMFORT_STEP) * 2) / 2))
         if repeat:
             action = "already noted"
         elif feeling == "too_cold" and behind and room.extra_lead < MAX_EXTRA_LEAD_H:
@@ -818,11 +835,15 @@ class HeatingController:
                 f"now starts heating {round(room.extra_lead * 60)} min earlier"
             )
         elif feeling == "too_cold":
-            room.comfort[period] = min(COMFORT_LIMIT, offset + COMFORT_STEP)
+            room.comfort[period] = min(COMFORT_LIMIT, offset + step)
             action = f"raised the {period} target by {room.comfort[period] - offset:+.1f}C"
+            if step > COMFORT_STEP:
+                action += f", to above the {temp:.1f}C the room was at"
         else:
-            room.comfort[period] = max(-COMFORT_LIMIT, offset - COMFORT_STEP)
+            room.comfort[period] = max(-COMFORT_LIMIT, offset - step)
             action = f"lowered the {period} target by {room.comfort[period] - offset:+.1f}C"
+            if step > COMFORT_STEP:
+                action += f", to below the {temp:.1f}C the room was at"
             if leftover is not None:
                 action = (
                     f"room was {temp:.1f}C, above its {target:.1f}C target, so the heat was left "

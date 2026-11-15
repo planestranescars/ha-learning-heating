@@ -32,7 +32,10 @@ that takes a target temperature plus a sensor reporting the valve opening.
   room was still short of its target makes it start earlier. Too hot while the room was
   already well above its target (heat left over from earlier, e.g. a warm evening at
   bedtime) lowers that earlier, warmer part of the day. Otherwise the target for that
-  part of the day moves by 0.5 °C. A second press within 10 minutes isn't counted twice.
+  part of the day moves by 0.5 °C, or by up to 1.5 °C where that is needed to put the
+  target on the right side of the temperature the room was at (too cold at 17.3 °C
+  means the target must be above 17.3 °C to bring any heat). A second press within
+  10 minutes isn't counted twice.
 - **Electric heaters**: a room without a `valve` and `zone` is heated by heaters that
   have their own thermostats, such as panel heaters. Its warm-up is learnt in the same
   way. A second heater given as `boost` only runs to help the room warm up, or when it
