@@ -111,7 +111,12 @@ class ColdHoursSensor(SensorEntity):
             for room in self.controller.rooms.values()
             if room.cold_hours >= 0.05
         }
-        return {"rooms": rooms, "yesterday": self.controller.cold_yesterday}
+        out = self.controller.out_since
+        return {
+            "rooms": rooms,
+            "yesterday": self.controller.cold_yesterday,
+            "everyone_out_since": out.isoformat() if out else None,
+        }
 
 
 class TemperatureSensor(_RoomSensor):

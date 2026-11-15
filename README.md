@@ -25,6 +25,9 @@ that takes a target temperature plus a sensor reporting the valve opening.
   once the room is warm enough, so it stops holding its zone and the boiler on.
 - **Keeps score**: `sensor.heating_cold_room_hours_today` counts the hours rooms in use
   spent more than 1 °C colder than wanted, to weigh against heating run time.
+- **Presence**: list `people` and, once all of them have been out for 20 minutes, rooms
+  ease off by 2 °C (to setback after 12 hours). Normal service resumes the moment anyone
+  is home. `switch.heating_guests_staying` turns this off while untracked people stay.
 - **Comfort feedback**: "too hot" / "too cold" buttons and a service. Too cold while the
   room was still short of its target makes it start earlier. Too hot while the room was
   already well above its target (heat left over from earlier, e.g. a warm evening at

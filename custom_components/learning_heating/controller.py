@@ -64,6 +64,10 @@ MAX_VALVE_CORRECTION = 4.0
 EASING_EXIT = 0.5
 VALVE_LEARN_INTERVAL = timedelta(hours=24)
 COLD_MARGIN = 1.0
+AWAY_DELAY = timedelta(minutes=20)
+LONG_AWAY = timedelta(hours=12)
+AWAY_DROP = 2.0
+STATE_HOME = "home"
 FEEDBACK_LOG_SIZE = 20
 FEEDBACK_MAX_AGE = timedelta(days=2)
 BAD_STATES = (STATE_UNAVAILABLE, STATE_UNKNOWN)
@@ -134,6 +138,10 @@ class Room:
             return f"Set by hand to {temp} until {_when(self.override_until)}"
         if self.reason == "unoccupied":
             return f"Not in use, kept at {temp}"
+        if self.reason == "out":
+            return f"Nobody home, so eased off to {temp}"
+        if self.reason == "away":
+            return f"Nobody home for a while, kept at {temp}"
         if self.reason == "warm outside":
             return f"Mild outside, so eased off to {temp}"
         if self.reason.startswith("pre-heating") and self.event_at:
@@ -174,6 +182,9 @@ class HeatingController:
         self.warm_cutoff: float = conf["warm_cutoff"]
         self.max_preheat: float = conf["max_preheat_hours"]
         self.history_days: int = conf["history_days"]
+        self.people: list[str] = conf["people"]
+        self.guests = False
+        self.out_since: datetime | None = None
         self.rooms = {
             slug: Room(slug, room, conf["setback"]) for slug, room in conf["rooms"].items()
         }
@@ -240,6 +251,8 @@ class HeatingController:
         track(list(valves), callback(lambda e: self._on_valve(valves[e.data["entity_id"]], e)))
         track(list(zones), callback(lambda e: self._on_zone(zones[e.data["entity_id"]], e)))
         track([self.weather], self._on_weather)
+        if self.people:
+            track(self.people, self._on_person)
 
         async_track_time_interval(self.hass, self._async_tick, TICK)
         async_track_time_interval(self.hass, self._async_refresh_forecast, FORECAST_REFRESH)
@@ -324,6 +337,32 @@ class HeatingController:
         self.outdoor = value
         for room in self.rooms.values():
             room.learner.set_outdoor(new.last_updated.timestamp(), value)
+
+    @callback
+    def _on_person(self, event: Event) -> None:
+        """Someone came or went: re-plan straight away rather than at the next tick."""
+        old: State | None = event.data["old_state"]
+        new: State | None = event.data["new_state"]
+        if self._ticking and (old is None or new is None or old.state != new.state):
+            self.hass.async_create_task(self.async_tick())
+
+    def _update_presence(self, now: datetime) -> None:
+        """Track since when everyone has been out. Unknown counts as home."""
+        states = [self.hass.states.get(person) for person in self.people]
+        everyone_out = bool(states) and all(
+            state is not None and state.state not in BAD_STATES and state.state != STATE_HOME
+            for state in states
+        )
+        if not everyone_out:
+            self.out_since = None
+        elif self.out_since is None:
+            self.out_since = min(now, max(state.last_changed for state in states))
+
+    def out_for(self, now: datetime) -> timedelta | None:
+        """How long the home has been empty, once that is long enough to act on."""
+        if self.guests or self.out_since is None or now - self.out_since < AWAY_DELAY:
+            return None
+        return now - self.out_since
 
     @callback
     def _on_climate(self, room: Room, event: Event) -> None:
@@ -448,8 +487,13 @@ class HeatingController:
                 return
             room.override_until = None
 
+        out = self.out_for(now)
         if not room.occupied:
             target, reason = room.setback, "unoccupied"
+        elif out is not None and out >= LONG_AWAY:
+            target, reason = min(base, room.setback), "away"
+        elif out is not None:
+            target, reason = max(min(base, room.setback), base - AWAY_DROP), "out"
         elif self.warm:
             target, reason = min(base, room.setback), "warm outside"
         else:
@@ -544,6 +588,7 @@ class HeatingController:
             for room in self.rooms.values():
                 room.learner.advance(now.timestamp())
             self._update_warm(now)
+            self._update_presence(now)
             for room in self.rooms.values():
                 self._decide(room, now)
                 if self.enabled:

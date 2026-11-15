@@ -20,6 +20,8 @@ async def async_setup_platform(
         return
     controller: HeatingController = hass.data[DOMAIN]
     entities: list[SwitchEntity] = [ControlSwitch(controller)]
+    if controller.people:
+        entities.append(GuestsSwitch(controller))
     entities += [OccupiedSwitch(controller, room) for room in controller.rooms.values()]
     async_add_entities(entities)
 
@@ -70,6 +72,20 @@ class ControlSwitch(_Switch):
 
     def _set(self, value: bool) -> None:
         self.controller.enabled = value
+
+
+class GuestsSwitch(_Switch):
+    """On: people the home can't track are staying, so don't ease off when everyone tracked is out."""
+
+    _attr_name = "Heating guests staying"
+    _attr_unique_id = f"{DOMAIN}_guests"
+    _attr_icon = "mdi:account-group"
+
+    def _get(self) -> bool:
+        return self.controller.guests
+
+    def _set(self, value: bool) -> None:
+        self.controller.guests = value
 
 
 class OccupiedSwitch(_Switch):

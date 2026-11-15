@@ -40,6 +40,7 @@ CONFIG_SCHEMA = vol.Schema(
                 vol.Optional("warm_cutoff", default=16.0): vol.Coerce(float),
                 vol.Optional("max_preheat_hours", default=3.0): vol.Coerce(float),
                 vol.Optional("history_days", default=10): cv.positive_int,
+                vol.Optional("people", default=[]): cv.entity_ids,
                 vol.Required("rooms"): {cv.slug: ROOM_SCHEMA},
             }
         )

@@ -9,6 +9,8 @@ setback: 14                      # used when a room's "occupied" switch is off
 warm_cutoff: 16                  # above this outdoor mean, rooms drop to setback
 max_preheat_hours: 3
 history_days: 10                 # history replayed on first start
+people:                          # optional: ease off when all of them are out
+  - person.alex
 
 # Binary sensors that are on while each boiler zone is circulating hot water.
 zones:
