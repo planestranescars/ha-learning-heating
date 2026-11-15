@@ -18,7 +18,7 @@ async def async_setup_platform(
     if discovery_info is None:
         return
     controller: HeatingController = hass.data[DOMAIN]
-    entities: list[SensorEntity] = []
+    entities: list[SensorEntity] = [ColdHoursSensor(controller)]
     for room in controller.rooms.values():
         entities += [
             TargetSensor(controller, room),
@@ -75,7 +75,43 @@ class TargetSensor(_RoomSensor):
             "extra_preheat_minutes": round(room.extra_lead * 60),
             "last_feedback": room.feedback_log[-1]["action"] if room.feedback_log else None,
             "feedback_count": len(room.feedback_log),
+            "valve_setting": room.setpoint,
+            "valve_shuts_above_setting_by": room.shut_gap,
+            "valve_correction": room.valve_correction,
+            "cold_hours_today": round(room.cold_hours, 1),
         }
+
+
+class ColdHoursSensor(SensorEntity):
+    """Room-hours today that rooms in use were more than a degree colder than wanted."""
+
+    _attr_should_poll = False
+    _attr_name = "Heating cold room hours today"
+    _attr_unique_id = f"{DOMAIN}_cold_room_hours"
+    _attr_native_unit_of_measurement = "h"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_icon = "mdi:snowflake-thermometer"
+
+    def __init__(self, controller: HeatingController) -> None:
+        self.controller = controller
+
+    async def async_added_to_hass(self) -> None:
+        self.async_on_remove(
+            async_dispatcher_connect(self.hass, SIGNAL_UPDATE, self.async_write_ha_state)
+        )
+
+    @property
+    def native_value(self) -> float:
+        return round(sum(room.cold_hours for room in self.controller.rooms.values()), 1)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        rooms = {
+            room.name: round(room.cold_hours, 1)
+            for room in self.controller.rooms.values()
+            if room.cold_hours >= 0.05
+        }
+        return {"rooms": rooms, "yesterday": self.controller.cold_yesterday}
 
 
 class TemperatureSensor(_RoomSensor):

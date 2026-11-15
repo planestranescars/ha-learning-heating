@@ -19,6 +19,12 @@ that takes a target temperature plus a sensor reporting the valve opening.
 - **Warm-weather cut-off**: rooms drop to setback when the outdoor forecast is mild.
 - **Respects manual changes** made at the valve or in Home Assistant until the room's
   next schedule change, including changes made while Home Assistant was restarting.
+- **Corrects valves that won't shut**: learns from history how far above its setpoint
+  each valve stops calling for heat (needs a `valve` attribute on the climate entity).
+  A valve that stays open several degrees above its setpoint is sent a lower number
+  once the room is warm enough, so it stops holding its zone and the boiler on.
+- **Keeps score**: `sensor.heating_cold_room_hours_today` counts the hours rooms in use
+  spent more than 1 °C colder than wanted, to weigh against heating run time.
 - **Comfort feedback**: "too hot" / "too cold" buttons and a service. Too cold while the
   room was still short of its target makes it start earlier. Too hot while the room was
   already well above its target (heat left over from earlier, e.g. a warm evening at

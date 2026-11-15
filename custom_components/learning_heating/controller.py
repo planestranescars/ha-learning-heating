@@ -31,6 +31,7 @@ from homeassistant.util import dt as dt_util
 from .const import DOMAIN, SIGNAL_UPDATE
 from .model import RoomLearner
 from .schedule import points_for_day
+from .valves import shut_gap
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -57,6 +58,12 @@ LEAD_STEP_H = 0.5
 MAX_EXTRA_LEAD_H = 3.0
 BEHIND_TARGET = 0.5
 REPEAT_PRESS = timedelta(minutes=10)
+NORMAL_SHUT_GAP = 1.0
+MIN_VALVE_CORRECTION = 1.5
+MAX_VALVE_CORRECTION = 4.0
+EASING_EXIT = 0.5
+VALVE_LEARN_INTERVAL = timedelta(hours=24)
+COLD_MARGIN = 1.0
 FEEDBACK_LOG_SIZE = 20
 FEEDBACK_MAX_AGE = timedelta(days=2)
 BAD_STATES = (STATE_UNAVAILABLE, STATE_UNKNOWN)
@@ -97,6 +104,11 @@ class Room:
         self.learner = RoomLearner()
         self.valve_open = 0.0
         self.target: float | None = None
+        self.wanted: float | None = None
+        self.setpoint: float | None = None
+        self.shut_gap: float | None = None
+        self.easing = False
+        self.cold_hours = 0.0
         self.reason = "starting"
         self.next_change: datetime | None = None
         self.next_target: float | None = None
@@ -133,6 +145,14 @@ class Room:
         return f"Keeping {temp}"
 
     @property
+    def valve_correction(self) -> float:
+        """How much lower to set a valve that stays open well above its setpoint."""
+        if self.shut_gap is None:
+            return 0.0
+        extra = self.shut_gap - NORMAL_SHUT_GAP
+        return min(MAX_VALVE_CORRECTION, extra) if extra >= MIN_VALVE_CORRECTION else 0.0
+
+    @property
     def held(self) -> bool:
         """Overridden by hand, or its valve switched off by hand."""
         return self.override_until is not None or self.reason == REASON_VALVE_OFF
@@ -167,12 +187,24 @@ class HeatingController:
         self._ticking = False
         self._written: dict[str, float] = {}
         self._unchecked = set(self.rooms)
+        self.score_date: str | None = None
+        self.cold_yesterday: float | None = None
+        self._last_scored: datetime | None = None
 
     # ---- lifecycle -------------------------------------------------------
 
     async def async_load(self) -> None:
         data = await self._store.async_load() or {}
         self._written: dict[str, float] = data.get("written", {})
+        for slug, gap in data.get("valve_gaps", {}).items():
+            if slug in self.rooms and gap is not None:
+                self.rooms[slug].shut_gap = float(gap)
+        score = data.get("score", {})
+        self.score_date = score.get("date")
+        self.cold_yesterday = score.get("yesterday")
+        for slug, hours in score.get("cold", {}).items():
+            if slug in self.rooms:
+                self.rooms[slug].cold_hours = float(hours)
         for slug, saved in data.get("comfort", {}).items():
             if slug in self.rooms:
                 self.rooms[slug].load_comfort(saved)
@@ -212,6 +244,8 @@ class HeatingController:
         async_track_time_interval(self.hass, self._async_tick, TICK)
         async_track_time_interval(self.hass, self._async_refresh_forecast, FORECAST_REFRESH)
         async_track_time_interval(self.hass, self._async_save, SAVE_INTERVAL)
+        async_track_time_interval(self.hass, self._async_learn_valves, VALVE_LEARN_INTERVAL)
+        self.hass.async_create_background_task(self._async_learn_valves(), f"{DOMAIN} valve learning")
         self.hass.async_create_task(self._async_refresh_forecast())
         async_call_later(self.hass, FIRST_TICK_DELAY_S, self._async_first_tick)
 
@@ -231,7 +265,7 @@ class HeatingController:
         (or, the very first time, from what we would set) as changed by hand."""
         self._unchecked.discard(room.slug)
         current = _float(state.attributes.get(ATTR_TEMPERATURE))
-        expected = self._written.get(room.slug, room.target)
+        expected = self._written.get(room.slug, room.setpoint)
         if state.state != HVACMode.HEAT or current is None or abs(current - expected) < 0.25:
             return False
         room.override_until = room.next_change or now + OVERRIDE_FALLBACK
@@ -409,6 +443,8 @@ class HeatingController:
 
         if room.override_until is not None:
             if now < room.override_until:
+                room.wanted = room.setpoint = room.target
+                room.easing = False
                 return
             room.override_until = None
 
@@ -421,6 +457,44 @@ class HeatingController:
 
         room.target = _round_target(target)
         room.reason = reason
+        # What the room is meant to be at right now, ignoring early warm-up or easing off.
+        room.wanted = min(base, room.target) if reason.startswith("pre-heating") else (
+            base if reason.startswith("coasting") else room.target
+        )
+
+    def _update_setpoint(self, room: Room, state: State) -> None:
+        """What to send the valve: the target, or lower for a valve that won't shut by itself."""
+        room.setpoint = room.target
+        correction = room.valve_correction
+        temp = _float(state.attributes.get("current_temperature"))
+        if room.target is None or not correction or temp is None:
+            room.easing = False
+            return
+        if temp >= room.target:
+            room.easing = True
+        elif temp < room.target - EASING_EXIT:
+            room.easing = False
+        if room.easing:
+            room.setpoint = _round_target(room.target - correction)
+
+    def _score(self, now: datetime) -> None:
+        """Count the hours each room in use spent more than a degree colder than wanted."""
+        today = now.date().isoformat()
+        if self.score_date != today:
+            if self.score_date is not None:
+                self.cold_yesterday = round(sum(r.cold_hours for r in self.rooms.values()), 2)
+            for room in self.rooms.values():
+                room.cold_hours = 0.0
+            self.score_date = today
+        elapsed = min(now - self._last_scored, 2 * TICK) if self._last_scored else timedelta()
+        self._last_scored = now
+        for room in self.rooms.values():
+            temp = room.learner.last_temp
+            if (
+                room.occupied and room.wanted is not None and temp is not None
+                and room.reason != REASON_VALVE_OFF and temp < room.wanted - COLD_MARGIN
+            ):
+                room.cold_hours += elapsed.total_seconds() / 3600
 
     def _plan(
         self, room: Room, now: datetime, base: float, upcoming: list[tuple[datetime, float]]
@@ -474,6 +548,7 @@ class HeatingController:
                 self._decide(room, now)
                 if self.enabled:
                     await self._async_apply(room, now)
+            self._score(now)
             async_dispatcher_send(self.hass, SIGNAL_UPDATE)
 
     async def _async_apply(self, room: Room, now: datetime) -> None:
@@ -487,22 +562,24 @@ class HeatingController:
         if state.state == HVACMode.OFF and not resume:
             room.reason = REASON_VALVE_OFF
             return
+        self._update_setpoint(room, state)
         if resume:
             self._unchecked.discard(room.slug)
         elif room.slug in self._unchecked and self._adopt_change_made_while_stopped(room, state, now):
             return
         current = _float(state.attributes.get(ATTR_TEMPERATURE))
-        if state.state == HVACMode.HEAT and current is not None and abs(current - room.target) < 0.25:
+        if state.state == HVACMode.HEAT and current is not None and abs(current - room.setpoint) < 0.25:
             return
-        if not resume and room.last_write and room.last_write[0] == room.target and now - room.last_write[1] < WRITE_RETRY:
+        if not resume and room.last_write and room.last_write[0] == room.setpoint and now - room.last_write[1] < WRITE_RETRY:
             return
         await self._async_write(room, state, now)
 
     async def _async_write(self, room: Room, state: State, now: datetime) -> None:
         current = _float(state.attributes.get(ATTR_TEMPERATURE))
-        room.last_write = (room.target, now)
+        value = room.setpoint if room.setpoint is not None else room.target
+        room.last_write = (value, now)
         room.recent_writes.append(room.last_write)
-        self._written[room.slug] = room.target
+        self._written[room.slug] = value
         self._store.async_delay_save(self._data, 30)
         try:
             if state.state != HVACMode.HEAT:
@@ -512,12 +589,12 @@ class HeatingController:
                 )
             await self.hass.services.async_call(
                 "climate", "set_temperature",
-                {"entity_id": room.climate, ATTR_TEMPERATURE: room.target}, blocking=True,
+                {"entity_id": room.climate, ATTR_TEMPERATURE: value}, blocking=True,
             )
         except HomeAssistantError as err:
-            _LOGGER.warning("Could not set %s to %.1f: %s", room.name, room.target, err)
+            _LOGGER.warning("Could not set %s to %.1f: %s", room.name, value, err)
             return
-        _LOGGER.info("%s: %s -> %.1f (%s)", room.name, current, room.target, room.reason)
+        _LOGGER.info("%s: %s -> %.1f (%s)", room.name, current, value, room.reason)
 
     # ---- comfort feedback -----------------------------------------------
 
@@ -609,7 +686,8 @@ class HeatingController:
             now = dt_util.now()
             upcoming = [at for at, _ in self.timeline(room, now) if at > now]
             room.override_until = upcoming[0] if upcoming else now + OVERRIDE_FALLBACK
-            room.target = _round_target(temp)
+            room.target = room.setpoint = _round_target(temp)
+            room.easing = False
             room.reason = "manual override"
             state = self.hass.states.get(room.climate)
             if self.enabled and state is not None and state.state not in BAD_STATES:
@@ -739,6 +817,38 @@ class HeatingController:
         await self._async_save()
         async_dispatcher_send(self.hass, SIGNAL_UPDATE)
 
+    async def _async_learn_valves(self, _now: datetime | None = None) -> None:
+        """Learn from history how far above its setpoint each valve stops calling for heat."""
+        end = dt_util.utcnow()
+        start = end - timedelta(days=self.history_days)
+        try:
+            states = await get_instance(self.hass).async_add_executor_job(
+                partial(
+                    history.get_significant_states, self.hass, start, end,
+                    entity_ids=[room.climate for room in self.rooms.values()],
+                    significant_changes_only=True,
+                )
+            )
+        except Exception:  # noqa: BLE001 - optional; valves are simply left uncorrected
+            _LOGGER.exception("Could not read valve history")
+            return
+        for room in self.rooms.values():
+            samples = [
+                (
+                    state.last_updated.timestamp(),
+                    _float(state.attributes.get("current_temperature")),
+                    _float(state.attributes.get(ATTR_TEMPERATURE)),
+                    _float(state.attributes.get("valve")),
+                )
+                for state in states.get(room.climate, [])
+                if state.state not in BAD_STATES
+            ]
+            gap = shut_gap(samples)
+            if gap is not None:
+                room.shut_gap = gap
+        await self._async_save()
+        async_dispatcher_send(self.hass, SIGNAL_UPDATE)
+
     async def _async_save(self, _now: datetime | None = None) -> None:
         await self._store.async_save(self._data())
 
@@ -748,4 +858,10 @@ class HeatingController:
             "rooms": {slug: room.learner.as_dict() for slug, room in self.rooms.items()},
             "comfort": {slug: room.comfort_as_dict() for slug, room in self.rooms.items()},
             "written": self._written,
+            "valve_gaps": {slug: room.shut_gap for slug, room in self.rooms.items()},
+            "score": {
+                "date": self.score_date,
+                "yesterday": self.cold_yesterday,
+                "cold": {slug: round(room.cold_hours, 3) for slug, room in self.rooms.items()},
+            },
         }
