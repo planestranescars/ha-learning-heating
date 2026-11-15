@@ -32,7 +32,7 @@ from homeassistant.util import dt as dt_util
 from .const import DOMAIN, SIGNAL_UPDATE
 from .model import RoomLearner
 from .quiet import calling, round_to_step, window
-from .schedule import points_for_day
+from .schedule import points_for_day, scheduled_temps
 from .valves import shut_gap
 
 _LOGGER = logging.getLogger(__name__)
@@ -72,6 +72,13 @@ LONG_AWAY = timedelta(hours=12)
 AWAY_DROP = 2.0
 STATE_HOME = "home"
 QUIET_PREP = timedelta(minutes=20)
+ROOM_AWAY = timedelta(hours=2)
+TRIAL_STEP = 0.5
+TRIAL_DAYS = 7
+TRIAL_CALM = timedelta(days=7)
+TRIAL_LIMIT = 2.0
+FLOOR_HOLD = timedelta(days=30)
+IDLE_REASONS = ("unoccupied", "out", "away", "warm outside")
 BOOST_GAP = 2.0
 DEFAULT_HEATER_W = 1000.0
 FEEDBACK_LOG_SIZE = 20
@@ -118,6 +125,13 @@ class Room:
         self.boost_wanted: bool | None = None
         self.energy = 0.0
         self.energy_yesterday: float | None = None
+        self.people: list[str] = conf["people"]
+        self.out_since: datetime | None = None
+        self.who = ""
+        self.trial: dict[str, Any] | None = None
+        self.floors: dict[str, str] = {}
+        self.tried: dict[str, str] = {}
+        self.calm_since: str | None = None
         self.schedule = conf["schedule"]
         self.setback: float = conf.get("setback", default_setback)
         self.occupied: bool = conf["occupied"]
@@ -155,9 +169,9 @@ class Room:
         if self.reason == "unoccupied":
             return f"Not in use, kept at {temp}"
         if self.reason == "out":
-            return f"Nobody home, so eased off to {temp}"
+            return f"{self.who + ' out' if self.who else 'Nobody home'}, so eased off to {temp}"
         if self.reason == "away":
-            return f"Nobody home for a while, kept at {temp}"
+            return f"{self.who + ' out' if self.who else 'Nobody home'} for a while, kept at {temp}"
         if self.reason == "warm outside":
             return f"Mild outside, so eased off to {temp}"
         if self.reason == REASON_QUIET and self.quiet_until:
@@ -189,13 +203,30 @@ class Room:
         """Overridden by hand, or its valve switched off by hand."""
         return self.override_until is not None or self.reason == REASON_VALVE_OFF
 
+    @property
+    def trial_summary(self) -> str | None:
+        if self.trial is None:
+            return None
+        return (
+            f"Trying {TRIAL_STEP:g}° less from {self.trial['period']}: "
+            f"{len(self.trial['days'])} of {TRIAL_DAYS} days without complaint"
+        )
+
     def comfort_as_dict(self) -> dict[str, Any]:
-        return {"offsets": self.comfort, "extra_lead": self.extra_lead, "log": self.feedback_log}
+        return {
+            "offsets": self.comfort, "extra_lead": self.extra_lead, "log": self.feedback_log,
+            "trial": self.trial, "floors": self.floors, "tried": self.tried,
+            "calm_since": self.calm_since,
+        }
 
     def load_comfort(self, data: dict[str, Any]) -> None:
         self.comfort = {k: float(v) for k, v in data.get("offsets", {}).items()}
         self.extra_lead = float(data.get("extra_lead", 0.0))
         self.feedback_log = list(data.get("log", []))
+        self.trial = data.get("trial")
+        self.floors = dict(data.get("floors", {}))
+        self.tried = dict(data.get("tried", {}))
+        self.calm_since = data.get("calm_since")
 
 
 class HeatingController:
@@ -288,8 +319,9 @@ class HeatingController:
         track(list(heaters), callback(lambda e: self._on_heater(heaters[e.data["entity_id"]], e)))
         track(list(zones), callback(lambda e: self._on_zone(zones[e.data["entity_id"]], e)))
         track([self.weather], self._on_weather)
-        if self.people:
-            track(self.people, self._on_person)
+        people = set(self.people) | {p for room in self.rooms.values() for p in room.people}
+        if people:
+            track(list(people), self._on_person)
 
         async_track_time_interval(self.hass, self._async_tick, TICK)
         async_track_time_interval(self.hass, self._async_refresh_forecast, FORECAST_REFRESH)
@@ -417,23 +449,38 @@ class HeatingController:
         if self._ticking and (old is None or new is None or old.state != new.state):
             self.hass.async_create_task(self.async_tick())
 
-    def _update_presence(self, now: datetime) -> None:
-        """Track since when everyone has been out. Unknown counts as home."""
-        states = [self.hass.states.get(person) for person in self.people]
+    def _out_since(
+        self, people: list[str], previous: datetime | None, now: datetime
+    ) -> datetime | None:
+        """Since when all of these people have been out. Unknown counts as home."""
+        states = [self.hass.states.get(person) for person in people]
         everyone_out = bool(states) and all(
             state is not None and state.state not in BAD_STATES and state.state != STATE_HOME
             for state in states
         )
         if not everyone_out:
-            self.out_since = None
-        elif self.out_since is None:
-            self.out_since = min(now, max(state.last_changed for state in states))
-
-    def out_for(self, now: datetime) -> timedelta | None:
-        """How long the home has been empty, once that is long enough to act on."""
-        if self.guests or self.out_since is None or now - self.out_since < AWAY_DELAY:
             return None
-        return now - self.out_since
+        return previous or min(now, max(state.last_changed for state in states))
+
+    def _update_presence(self, now: datetime) -> None:
+        self.out_since = self._out_since(self.people, self.out_since, now)
+        for room in self.rooms.values():
+            if room.people:
+                room.out_since = self._out_since(room.people, room.out_since, now)
+                names = [s.name for p in room.people if (s := self.hass.states.get(p)) is not None]
+                room.who = " and ".join(names)
+
+    def _room_out(self, room: Room, now: datetime, quiet: bool) -> tuple[timedelta | None, timedelta]:
+        """How long the people a room follows have been out, and how long counts as away.
+
+        A room with its own people ignores everyone else. Going into quiet hours, only a
+        long absence counts: a brief one must not leave the room cold all night.
+        """
+        since, long_away = (room.out_since, ROOM_AWAY) if room.people else (self.out_since, LONG_AWAY)
+        if self.guests or since is None or now - since < AWAY_DELAY:
+            return None, long_away
+        out = now - since
+        return (None if quiet and out < long_away else out), long_away
 
     @callback
     def _on_climate(self, room: Room, event: Event) -> None:
@@ -461,6 +508,7 @@ class HeatingController:
             return
         upcoming = [at for at, _ in self.timeline(room, now) if at > now]
         room.override_until = upcoming[0] if upcoming else now + OVERRIDE_FALLBACK
+        self._hand_change(room, now, room.target is not None and target > room.target)
         room.target = target
         room.reason = "manual override"
         _LOGGER.info(
@@ -571,10 +619,10 @@ class HeatingController:
                 return
             room.override_until = None
 
-        out = self.out_for(now)
+        out, long_away = self._room_out(room, now, quiet is not None)
         if not room.occupied:
             target, reason = room.setback, "unoccupied"
-        elif out is not None and out >= LONG_AWAY:
+        elif out is not None and out >= long_away:
             target, reason = min(base, room.setback), "away"
         elif out is not None:
             target, reason = max(min(base, room.setback), base - AWAY_DROP), "out"
@@ -609,6 +657,73 @@ class HeatingController:
             room.easing = False
         if room.easing:
             room.setpoint = _round_target(room.target - correction)
+
+    # ---- trying less heat ------------------------------------------------
+
+    def _trials(self, room: Room, now: datetime) -> None:
+        """Slowly find the lowest comfortable temperatures.
+
+        After a week with no complaint or hand change, one part of the room's day is set
+        half a degree lower. Seven days in use without a complaint keeps it. A "too cold"
+        or a hand turn-up puts it back and leaves that part of the day alone for a month.
+        """
+        if room.trial is not None:
+            today = now.date().isoformat()
+            if (
+                room.occupied and room.override_until is None
+                and room.reason not in IDLE_REASONS and room.reason != REASON_VALVE_OFF
+                and today not in room.trial["days"]
+                and self._period_at(room, now) == room.trial["period"]
+            ):
+                room.trial["days"].append(today)
+            if len(room.trial["days"]) >= TRIAL_DAYS:
+                self._end_trial(room, now, failed=False, revert=False)
+            return
+        if not room.occupied:
+            return
+        if room.calm_since is None:
+            room.calm_since = now.isoformat()
+            return
+        if now - datetime.fromisoformat(room.calm_since) < TRIAL_CALM:
+            return
+        options = []
+        for key, temp in scheduled_temps(room.schedule).items():
+            offset = room.comfort.get(key, 0.0)
+            floor = room.floors.get(key)
+            if (
+                temp + offset - TRIAL_STEP <= room.setback
+                or offset - TRIAL_STEP < -TRIAL_LIMIT
+                or (floor is not None and now < datetime.fromisoformat(floor))
+            ):
+                continue
+            options.append((room.tried.get(key, ""), -(temp + offset), key))
+        if not options:
+            return
+        period = min(options)[2]
+        room.comfort[period] = room.comfort.get(period, 0.0) - TRIAL_STEP
+        room.trial = {"period": period, "started": now.isoformat(timespec="minutes"), "days": []}
+        _LOGGER.info("%s: trying %.1f less from %s", room.name, TRIAL_STEP, period)
+
+    def _end_trial(self, room: Room, now: datetime, failed: bool, revert: bool) -> None:
+        period = room.trial["period"]
+        if revert:
+            room.comfort[period] = room.comfort.get(period, 0.0) + TRIAL_STEP
+            if room.comfort[period] == 0.0:
+                room.comfort.pop(period)
+        room.tried[period] = now.isoformat(timespec="minutes")
+        if failed:
+            room.floors[period] = (now + FLOOR_HOLD).isoformat(timespec="minutes")
+        room.trial = None
+        _LOGGER.info(
+            "%s: less heat from %s %s", room.name, period,
+            "was too cold; left alone for a month" if failed else "went unnoticed; kept",
+        )
+
+    def _hand_change(self, room: Room, now: datetime, warmer: bool) -> None:
+        """Someone changed the room by hand: a sign of discomfort if they turned it up."""
+        room.calm_since = now.isoformat()
+        if warmer and room.trial is not None and self._period_at(room, now) == room.trial["period"]:
+            self._end_trial(room, now, failed=True, revert=True)
 
     def _score(self, now: datetime) -> None:
         """Count the hours each room in use spent more than a degree colder than wanted."""
@@ -687,6 +802,7 @@ class HeatingController:
                 if self.enabled:
                     await self._async_apply(room, now)
                     await self._async_boost(room, now)
+                    self._trials(room, now)
                 if room.zone is None:
                     room.learner.set_valve(now.timestamp(), self._effective_valve(room))
             self._score(now)
@@ -852,6 +968,12 @@ class HeatingController:
             elif overshot and room.extra_lead > 0:
                 room.extra_lead = max(0.0, room.extra_lead - LEAD_STEP_H)
                 action += f"; warm-up lead cut to {round(room.extra_lead * 60)} min"
+        if not repeat:
+            room.calm_since = now.isoformat()
+            if feeling == "too_cold" and room.trial is not None and room.trial["period"] == period:
+                raised = room.comfort.get(period, 0.0) > offset
+                self._end_trial(room, now, failed=True, revert=not raised)
+                action += "; stopped trying less heat here for a month"
         if room.comfort.get(period) == 0.0:
             room.comfort.pop(period)
 
@@ -903,6 +1025,9 @@ class HeatingController:
         room.comfort = {}
         room.extra_lead = 0.0
         room.feedback_log = []
+        room.trial = None
+        room.floors = {}
+        room.tried = {}
         await self._async_save()
         await self.async_tick()
 

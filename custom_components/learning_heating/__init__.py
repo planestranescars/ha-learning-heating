@@ -25,6 +25,7 @@ ROOM_SCHEMA = vol.Schema(
         vol.Optional("valve"): cv.entity_id,
         vol.Optional("zone"): cv.string,
         vol.Optional("boost"): cv.entity_id,
+        vol.Optional("people", default=[]): cv.entity_ids,
         vol.Optional("power"): vol.Coerce(float),
         vol.Optional("boost_power"): vol.Coerce(float),
         vol.Optional("quiet"): vol.Schema(

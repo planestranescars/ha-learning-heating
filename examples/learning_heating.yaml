@@ -49,6 +49,8 @@ rooms:
     power: 1000                    # watts, for the estimated energy sensor
     boost: climate.attic_second_heater   # only runs to help the room warm up
     boost_power: 1000
+    people:                        # follow these people, not the whole household
+      - person.sam
     quiet:                         # send the heaters nothing between these times
       from: "21:45"
       to: "07:00"

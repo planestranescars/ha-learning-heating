@@ -36,6 +36,14 @@ that takes a target temperature plus a sensor reporting the valve opening.
   target on the right side of the temperature the room was at (too cold at 17.3 °C
   means the target must be above 17.3 °C to bring any heat). A second press within
   10 minutes isn't counted twice.
+- **Rooms that follow a person**: give a room its own `people` and it ignores everyone
+  else: it eases off by 2 °C when they have all been out for 20 minutes, and drops to
+  its setback after 2 hours.
+- **Trying less heat**: after a week with no complaint or hand change in a room, one
+  part of its day is set 0.5 °C lower. Seven days in use without a complaint keeps the
+  saving and the next part of the day gets its turn. A "too cold" or a hand turn-up
+  puts it back and leaves that part of the day alone for a month. It never goes more
+  than 2 °C below the schedule.
 - **Electric heaters**: a room without a `valve` and `zone` is heated by heaters that
   have their own thermostats, such as panel heaters. Its warm-up is learnt in the same
   way. A second heater given as `boost` only runs to help the room warm up, or when it

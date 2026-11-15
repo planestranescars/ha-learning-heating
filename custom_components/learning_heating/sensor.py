@@ -82,6 +82,9 @@ class TargetSensor(_RoomSensor):
             "valve_correction": room.valve_correction,
             "cold_hours_today": round(room.cold_hours, 1),
             "quiet_until": room.quiet_until.isoformat() if room.quiet_until else None,
+            "follows": room.people or None,
+            "trying_less": room.trial_summary,
+            "left_alone_until": dict(room.floors),
             "boost_heater_on": room.boost_wanted if room.boost else None,
         }
 

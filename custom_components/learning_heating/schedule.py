@@ -68,6 +68,15 @@ def entry_key(kind: str, minutes: int) -> str:
     return f"{kind}{sign}{abs(minutes) // 60:02d}:{abs(minutes) % 60:02d}"
 
 
+def scheduled_temps(entries: list[Entry]) -> dict[str, float]:
+    """Each schedule entry's temperature, by the key that feedback adjustments use."""
+    temps = {}
+    for kind, minutes, temp, days in entries:
+        key = entry_key(kind, minutes)
+        temps[f"{days} {key}" if days else key] = temp
+    return temps
+
+
 def points_for_day(
     hass: HomeAssistant, day: date, entries: list[Entry]
 ) -> list[tuple[datetime, float, str]]:
