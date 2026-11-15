@@ -11,6 +11,7 @@ max_preheat_hours: 3
 history_days: 10                 # history replayed on first start
 people:                          # optional: ease off when all of them are out
   - person.alex
+energy_price: 0.30               # optional: per kWh, adds a cost to energy sensors
 
 # Binary sensors that are on while each boiler zone is circulating hot water.
 zones:
@@ -39,3 +40,23 @@ rooms:
     schedule:
       "06:30": 19
       "22:00": 16
+
+  # A room heated by electric heaters that have their own thermostats: leave out
+  # `valve` and `zone`. Optional extras, all shown here:
+  attic_bedroom:
+    name: Attic bedroom
+    climate: climate.attic_panel_heater
+    power: 1000                    # watts, for the estimated energy sensor
+    boost: climate.attic_second_heater   # only runs to help the room warm up
+    boost_power: 1000
+    quiet:                         # send the heaters nothing between these times
+      from: "21:45"
+      to: "07:00"
+    schedule:                      # a schedule can differ at weekends
+      weekdays:
+        "07:45": 14
+        "16:00": 19
+        "20:30": 18
+      weekends:
+        "09:00": 19
+        "20:30": 18

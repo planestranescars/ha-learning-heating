@@ -1,4 +1,4 @@
-"""Learns each room and drives the valve setpoints."""
+"""Learns each room and drives its valve or heater setpoints."""
 
 from __future__ import annotations
 
@@ -30,6 +30,7 @@ from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN, SIGNAL_UPDATE
 from .model import RoomLearner
+from .quiet import calling, round_to_step, window
 from .schedule import points_for_day
 from .valves import shut_gap
 
@@ -68,10 +69,14 @@ AWAY_DELAY = timedelta(minutes=20)
 LONG_AWAY = timedelta(hours=12)
 AWAY_DROP = 2.0
 STATE_HOME = "home"
+QUIET_PREP = timedelta(minutes=20)
+BOOST_GAP = 2.0
+DEFAULT_HEATER_W = 1000.0
 FEEDBACK_LOG_SIZE = 20
 FEEDBACK_MAX_AGE = timedelta(days=2)
 BAD_STATES = (STATE_UNAVAILABLE, STATE_UNKNOWN)
 REASON_VALVE_OFF = "valve switched off by hand"
+REASON_QUIET = "quiet hours"
 
 
 def _round_target(value: float) -> float:
@@ -100,8 +105,17 @@ class Room:
         self.slug = slug
         self.name: str = conf["name"]
         self.climate: str = conf["climate"]
-        self.valve: str = conf["valve"]
-        self.zone: str = conf["zone"]
+        self.valve: str | None = conf.get("valve")
+        self.zone: str | None = conf.get("zone")
+        self.boost: str | None = conf.get("boost")
+        self.power: float | None = conf.get("power")
+        self.boost_power: float | None = conf.get("boost_power")
+        quiet = conf.get("quiet")
+        self.quiet = (quiet["from"], quiet["to"]) if quiet else None
+        self.quiet_until: datetime | None = None
+        self.boost_wanted: bool | None = None
+        self.energy = 0.0
+        self.energy_yesterday: float | None = None
         self.schedule = conf["schedule"]
         self.setback: float = conf.get("setback", default_setback)
         self.occupied: bool = conf["occupied"]
@@ -130,7 +144,7 @@ class Room:
     def summary(self) -> str:
         """What the room is doing, in plain words."""
         if self.reason == REASON_VALVE_OFF:
-            return "Switched off at the radiator"
+            return "Switched off by hand"
         if self.target is None or self.reason == "starting":
             return "Starting up"
         temp = f"{self.target:g}°"
@@ -144,6 +158,8 @@ class Room:
             return f"Nobody home for a while, kept at {temp}"
         if self.reason == "warm outside":
             return f"Mild outside, so eased off to {temp}"
+        if self.reason == REASON_QUIET and self.quiet_until:
+            return f"Quiet hours: left at {temp} until {_when(self.quiet_until)}"
         if self.reason.startswith("pre-heating") and self.event_at:
             return f"Warming up to {temp} for {_when(self.event_at)}"
         if self.reason.startswith("coasting") and self.event_at:
@@ -159,6 +175,12 @@ class Room:
             return 0.0
         extra = self.shut_gap - NORMAL_SHUT_GAP
         return min(MAX_VALVE_CORRECTION, extra) if extra >= MIN_VALVE_CORRECTION else 0.0
+
+    def quiet_window(
+        self, now: datetime, lead: timedelta = timedelta()
+    ) -> tuple[datetime, datetime] | None:
+        """The quiet hours `now` is in, or within `lead` of. Nothing is sent during them."""
+        return window(now, *self.quiet, lead) if self.quiet else None
 
     @property
     def held(self) -> bool:
@@ -183,6 +205,7 @@ class HeatingController:
         self.max_preheat: float = conf["max_preheat_hours"]
         self.history_days: int = conf["history_days"]
         self.people: list[str] = conf["people"]
+        self.energy_price: float | None = conf.get("energy_price")
         self.guests = False
         self.out_since: datetime | None = None
         self.rooms = {
@@ -216,6 +239,12 @@ class HeatingController:
         for slug, hours in score.get("cold", {}).items():
             if slug in self.rooms:
                 self.rooms[slug].cold_hours = float(hours)
+        for slug, kwh in score.get("energy", {}).items():
+            if slug in self.rooms:
+                self.rooms[slug].energy = float(kwh)
+        for slug, kwh in score.get("energy_yesterday", {}).items():
+            if slug in self.rooms and kwh is not None:
+                self.rooms[slug].energy_yesterday = float(kwh)
         for slug, saved in data.get("comfort", {}).items():
             if slug in self.rooms:
                 self.rooms[slug].load_comfort(saved)
@@ -244,11 +273,17 @@ class HeatingController:
                 room.learner.observe(now, temp)
 
         climates = {room.climate: room for room in self.rooms.values()}
-        valves = {room.valve: room for room in self.rooms.values()}
+        valves = {room.valve: room for room in self.rooms.values() if room.valve}
+        heaters = {
+            entity: room
+            for room in self.rooms.values() if room.zone is None
+            for entity in (room.climate, room.boost) if entity
+        }
         zones = {entity: zone for zone, entity in self.zones.items()}
         track = partial(async_track_state_change_event, self.hass)
         track(list(climates), callback(lambda e: self._on_climate(climates[e.data["entity_id"]], e)))
         track(list(valves), callback(lambda e: self._on_valve(valves[e.data["entity_id"]], e)))
+        track(list(heaters), callback(lambda e: self._on_heater(heaters[e.data["entity_id"]], e)))
         track(list(zones), callback(lambda e: self._on_zone(zones[e.data["entity_id"]], e)))
         track([self.weather], self._on_weather)
         if self.people:
@@ -263,7 +298,10 @@ class HeatingController:
         async_call_later(self.hass, FIRST_TICK_DELAY_S, self._async_first_tick)
 
         async_dispatcher_send(self.hass, SIGNAL_UPDATE)
-        untrained = [r for r in self.rooms.values() if all(m.samples == 0 for m in r.learner.models)]
+        untrained = [
+            r for r in self.rooms.values()
+            if r.zone is not None and all(m.samples == 0 for m in r.learner.models)
+        ]
         if untrained:
             self.hass.async_create_background_task(
                 self._async_bootstrap(untrained), f"{DOMAIN} history bootstrap"
@@ -297,7 +335,7 @@ class HeatingController:
             state = self.hass.states.get(entity)
             self._zone_on[zone] = state is not None and state.state == STATE_ON
         for room in self.rooms.values():
-            state = self.hass.states.get(room.valve)
+            state = self.hass.states.get(room.valve) if room.valve else None
             room.valve_open = (_float(state.state) or 0.0) / 100 if state else 0.0
             if self.outdoor is not None:
                 room.learner.set_outdoor(now, self.outdoor)
@@ -306,7 +344,38 @@ class HeatingController:
     # ---- inputs ----------------------------------------------------------
 
     def _effective_valve(self, room: Room) -> float:
+        """How hard the room is being heated, from 0 to 1."""
+        if room.zone is None:
+            return self._heater_output(room)[0]
         return room.valve_open if self._zone_on.get(room.zone) else 0.0
+
+    def _heater_output(self, room: Room) -> tuple[float, float]:
+        """For a room of self-regulating heaters: share of full output, and estimated watts."""
+
+        def share(entity: str | None) -> float:
+            state = self.hass.states.get(entity) if entity else None
+            if state is None:
+                return 0.0
+            return calling(
+                state.state == HVACMode.HEAT,
+                _float(state.attributes.get("current_temperature")),
+                _float(state.attributes.get(ATTR_TEMPERATURE)),
+            )
+
+        main, boost = share(room.climate), share(room.boost)
+        main_w = room.power or DEFAULT_HEATER_W
+        boost_w = (room.boost_power or main_w) if room.boost else 0.0
+        watts = main * (room.power or 0.0) + boost * (room.boost_power or 0.0)
+        return (main * main_w + boost * boost_w) / (main_w + boost_w), watts
+
+    def heater_watts(self, room: Room) -> float:
+        return self._heater_output(room)[1]
+
+    @callback
+    def _on_heater(self, room: Room, event: Event) -> None:
+        new: State | None = event.data["new_state"]
+        if new is not None:
+            room.learner.set_valve(new.last_updated.timestamp(), self._effective_valve(room))
 
     @callback
     def _on_valve(self, room: Room, event: Event) -> None:
@@ -474,7 +543,12 @@ class HeatingController:
 
     def _decide(self, room: Room, now: datetime) -> None:
         points = self.timeline(room, now)
-        past = [p for p in points if p[0] <= now]
+        # Nothing can be sent in quiet hours, so shortly before them the room is set for
+        # the schedule as it stands when they begin, and left there until they end.
+        quiet = room.quiet_window(now, QUIET_PREP)
+        room.quiet_until = quiet[1] if quiet else None
+        at = quiet[0] if quiet else now
+        past = [p for p in points if p[0] <= at]
         upcoming = [p for p in points if p[0] > now]
         base = past[-1][1] if past else room.setback
         room.next_change, room.next_target = upcoming[0] if upcoming else (None, None)
@@ -496,6 +570,8 @@ class HeatingController:
             target, reason = max(min(base, room.setback), base - AWAY_DROP), "out"
         elif self.warm:
             target, reason = min(base, room.setback), "warm outside"
+        elif quiet:
+            target, reason = base, REASON_QUIET
         else:
             target, reason = self._plan(room, now, base, upcoming)
 
@@ -509,6 +585,9 @@ class HeatingController:
     def _update_setpoint(self, room: Room, state: State) -> None:
         """What to send the valve: the target, or lower for a valve that won't shut by itself."""
         room.setpoint = room.target
+        if room.target is not None:
+            step = _float(state.attributes.get("target_temp_step"))
+            room.setpoint = round_to_step(room.target, step)
         correction = room.valve_correction
         temp = _float(state.attributes.get("current_temperature"))
         if room.target is None or not correction or temp is None:
@@ -528,7 +607,9 @@ class HeatingController:
             if self.score_date is not None:
                 self.cold_yesterday = round(sum(r.cold_hours for r in self.rooms.values()), 2)
             for room in self.rooms.values():
-                room.cold_hours = 0.0
+                if self.score_date is not None:
+                    room.energy_yesterday = round(room.energy, 3)
+                room.cold_hours = room.energy = 0.0
             self.score_date = today
         elapsed = min(now - self._last_scored, 2 * TICK) if self._last_scored else timedelta()
         self._last_scored = now
@@ -539,6 +620,8 @@ class HeatingController:
                 and room.reason != REASON_VALVE_OFF and temp < room.wanted - COLD_MARGIN
             ):
                 room.cold_hours += elapsed.total_seconds() / 3600
+            if room.zone is None and room.power:
+                room.energy += self._heater_output(room)[1] / 1000 * elapsed.total_seconds() / 3600
 
     def _plan(
         self, room: Room, now: datetime, base: float, upcoming: list[tuple[datetime, float]]
@@ -593,11 +676,14 @@ class HeatingController:
                 self._decide(room, now)
                 if self.enabled:
                     await self._async_apply(room, now)
+                    await self._async_boost(room, now)
+                if room.zone is None:
+                    room.learner.set_valve(now.timestamp(), self._effective_valve(room))
             self._score(now)
             async_dispatcher_send(self.hass, SIGNAL_UPDATE)
 
     async def _async_apply(self, room: Room, now: datetime) -> None:
-        if room.override_until is not None or room.target is None:
+        if room.override_until is not None or room.target is None or room.quiet_window(now):
             return
         state = self.hass.states.get(room.climate)
         if state is None or state.state in BAD_STATES:
@@ -619,7 +705,51 @@ class HeatingController:
             return
         await self._async_write(room, state, now)
 
+    async def _async_boost(self, room: Room, now: datetime) -> None:
+        """Run a room's second heater only to help it warm up, and never into quiet hours."""
+        if room.boost is None or room.quiet_window(now):
+            return
+        state = self.hass.states.get(room.boost)
+        main = self.hass.states.get(room.climate)
+        if state is None or state.state in BAD_STATES or main is None:
+            return
+        temp = _float(main.attributes.get("current_temperature"))
+        preparing = room.quiet_window(now, QUIET_PREP) is not None
+        want = False
+        if (
+            not preparing and room.override_until is None and room.occupied
+            and main.state == HVACMode.HEAT and temp is not None
+            and room.target is not None and room.target > room.setback
+        ):
+            if room.boost_wanted or room.reason.startswith("pre-heating"):
+                want = temp < room.target
+            else:
+                want = temp <= room.target - BOOST_GAP
+        changed = want != room.boost_wanted
+        room.boost_wanted = want
+        if not (changed or preparing) or (state.state == HVACMode.HEAT) == want:
+            return
+        try:
+            await self.hass.services.async_call(
+                "climate", "set_hvac_mode",
+                {"entity_id": room.boost, "hvac_mode": HVACMode.HEAT if want else HVACMode.OFF},
+                blocking=True,
+            )
+            if want:
+                step = _float(state.attributes.get("target_temp_step"))
+                await self.hass.services.async_call(
+                    "climate", "set_temperature",
+                    {"entity_id": room.boost, ATTR_TEMPERATURE: round_to_step(room.target, step)},
+                    blocking=True,
+                )
+        except HomeAssistantError as err:
+            _LOGGER.warning("Could not switch %s boost heater: %s", room.name, err)
+            return
+        _LOGGER.info("%s boost heater %s (%s)", room.name, "on" if want else "off", room.reason)
+
     async def _async_write(self, room: Room, state: State, now: datetime) -> None:
+        if room.quiet_window(now):
+            return
         current = _float(state.attributes.get(ATTR_TEMPERATURE))
         value = room.setpoint if room.setpoint is not None else room.target
         room.last_write = (value, now)
@@ -713,7 +843,9 @@ class HeatingController:
             "action": action,
         }
         await self.async_tick()
-        if nudge and room.target is not None:
+        if nudge and room.quiet_window(now):
+            entry["action"] = action = f"{action}; nothing changed now, as it is quiet hours"
+        elif nudge and room.target is not None:
             held_at = room.target + (nudge if feeling == "too_cold" else -nudge)
             await self._async_hold(room, held_at)
             entry["action"] = action = (
@@ -783,6 +915,7 @@ class HeatingController:
         end = dt_util.utcnow()
         start = end - timedelta(days=self.history_days)
         recorder = get_instance(self.hass)
+        rooms = [r for r in rooms if r.zone is not None]
         zone_entities = {self.zones[r.zone]: r.zone for r in rooms}
         ids = [r.climate for r in rooms] + list(zone_entities)
         _LOGGER.info("Learning %d rooms from %d days of history", len(rooms), self.history_days)
@@ -878,6 +1011,8 @@ class HeatingController:
             _LOGGER.exception("Could not read valve history")
             return
         for room in self.rooms.values():
+            if room.valve is None:
+                continue
             samples = [
                 (
                     state.last_updated.timestamp(),
@@ -908,5 +1043,7 @@ class HeatingController:
                 "date": self.score_date,
                 "yesterday": self.cold_yesterday,
                 "cold": {slug: round(room.cold_hours, 3) for slug, room in self.rooms.items()},
+                "energy": {s: round(r.energy, 4) for s, r in self.rooms.items() if r.power},
+                "energy_yesterday": {s: r.energy_yesterday for s, r in self.rooms.items() if r.power},
             },
         }

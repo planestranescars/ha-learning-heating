@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity, SensorStateClass
-from homeassistant.const import UnitOfTemperature
+from homeassistant.const import UnitOfEnergy, UnitOfTemperature
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -25,6 +25,8 @@ async def async_setup_platform(
             TemperatureSensor(controller, room),
             WarmUpSensor(controller, room),
         ]
+        if room.zone is None and room.power:
+            entities.append(EnergySensor(controller, room))
     async_add_entities(entities)
 
 
@@ -79,6 +81,8 @@ class TargetSensor(_RoomSensor):
             "valve_shuts_above_setting_by": room.shut_gap,
             "valve_correction": room.valve_correction,
             "cold_hours_today": round(room.cold_hours, 1),
+            "quiet_until": room.quiet_until.isoformat() if room.quiet_until else None,
+            "boost_heater_on": room.boost_wanted if room.boost else None,
         }
 
 
@@ -116,6 +120,40 @@ class ColdHoursSensor(SensorEntity):
             "rooms": rooms,
             "yesterday": self.controller.cold_yesterday,
             "everyone_out_since": out.isoformat() if out else None,
+        }
+
+
+class EnergySensor(_RoomSensor):
+    """Estimated electricity used today by a room's own heaters, from their rated power."""
+
+    key = "energy"
+    _attr_device_class = SensorDeviceClass.ENERGY
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+    _attr_icon = "mdi:lightning-bolt"
+
+    def __init__(self, controller: HeatingController, room: Room) -> None:
+        super().__init__(controller, room)
+        self._attr_name = f"{room.name} heating energy today"
+
+    @property
+    def native_value(self) -> float:
+        return round(self.room.energy, 2)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        room = self.room
+        price = self.controller.energy_price
+
+        def cost(kwh: float | None) -> float | None:
+            return round(kwh * price, 2) if price is not None and kwh is not None else None
+
+        return {
+            "estimated": True,
+            "yesterday": room.energy_yesterday,
+            "cost_today": cost(room.energy),
+            "cost_yesterday": cost(room.energy_yesterday),
+            "power_now_w": round(self.controller.heater_watts(room)),
         }
 
 

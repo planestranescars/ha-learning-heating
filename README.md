@@ -33,6 +33,17 @@ that takes a target temperature plus a sensor reporting the valve opening.
   already well above its target (heat left over from earlier, e.g. a warm evening at
   bedtime) lowers that earlier, warmer part of the day. Otherwise the target for that
   part of the day moves by 0.5 °C. A second press within 10 minutes isn't counted twice.
+- **Electric heaters**: a room without a `valve` and `zone` is heated by heaters that
+  have their own thermostats, such as panel heaters. Its warm-up is learnt in the same
+  way. A second heater given as `boost` only runs to help the room warm up, or when it
+  has fallen 2 °C behind. With `power` set, the room gets an estimated energy sensor.
+- **Quiet hours**: for heaters that beep or click when sent a command. Between `from`
+  and `to` nothing at all is sent to the room. Twenty minutes beforehand the room is
+  set for the schedule as it stands when quiet hours begin, the boost heater is
+  switched off, and both are left alone until quiet hours end. Schedule changes that
+  fall inside quiet hours wait until they end, so put the bedtime entry before `from`.
+- **Weekday and weekend schedules**: give a room's schedule as two mappings under
+  `weekdays` and `weekends`.
 
 ## Install
 
@@ -58,6 +69,7 @@ Per room:
 | `switch.<room>_occupied` | Off holds the room at its setback temperature |
 | `button.<room>_too_hot` / `button.<room>_too_cold` | Comfort feedback for right now |
 | `button.<room>_resume_schedule` | Ends a manual change; only available while the room is held by one |
+| `sensor.<room>_heating_energy_today` | Electric rooms with `power` set: estimated kWh today, from rated power and whether each heater is below its setting. Not a meter reading. Yesterday's total and, with `energy_price`, the cost are attributes |
 
 Plus `switch.learning_heating_control`: off stops all valve writes (valves keep their
 last setting).

@@ -1,4 +1,7 @@
-"""Room schedules keyed by 'HH:MM', 'sunrise' or 'sunset' with an optional +/-HH:MM offset."""
+"""Room schedules keyed by 'HH:MM', 'sunrise' or 'sunset' with an optional +/-HH:MM offset.
+
+A schedule is either one mapping used every day, or two under `weekdays` and `weekends`.
+"""
 
 from __future__ import annotations
 
@@ -15,7 +18,8 @@ _SPEC = re.compile(
     r"^(?:(?P<hm>\d{1,2}:\d{2})|(?P<sun>sunrise|sunset)(?:\s*(?P<sign>[+-])\s*(?P<off>\d{1,2}:\d{2}))?)$"
 )
 
-Entry = tuple[str, int, float]
+Entry = tuple[str, int, float, str]
+DAY_GROUPS = {"weekdays": range(0, 5), "weekends": range(5, 7)}
 
 
 def _minutes(text: str) -> int:
@@ -35,7 +39,7 @@ def parse_spec(spec: str) -> tuple[str, int]:
     return match["sun"], -offset if match["sign"] == "-" else offset
 
 
-def validate_schedule(value) -> list[Entry]:
+def _entries(value, days: str = "") -> list[Entry]:
     if not isinstance(value, dict) or not value:
         raise vol.Invalid("schedule must map times to temperatures")
     entries = []
@@ -43,8 +47,16 @@ def validate_schedule(value) -> list[Entry]:
         if not isinstance(spec, str):
             raise vol.Invalid(f"schedule time {spec!r} must be quoted, e.g. \"22:00\"")
         kind, minutes = parse_spec(spec)
-        entries.append((kind, minutes, vol.Coerce(float)(temp)))
+        entries.append((kind, minutes, vol.Coerce(float)(temp), days))
     return entries
+
+
+def validate_schedule(value) -> list[Entry]:
+    if isinstance(value, dict) and value and set(value) <= set(DAY_GROUPS):
+        if set(value) != set(DAY_GROUPS):
+            raise vol.Invalid("a schedule split by day needs both 'weekdays' and 'weekends'")
+        return [entry for days, part in value.items() for entry in _entries(part, days)]
+    return _entries(value)
 
 
 def entry_key(kind: str, minutes: int) -> str:
@@ -60,7 +72,9 @@ def points_for_day(
     hass: HomeAssistant, day: date, entries: list[Entry]
 ) -> list[tuple[datetime, float, str]]:
     points = []
-    for kind, minutes, temp in entries:
+    for kind, minutes, temp, days in entries:
+        if days and day.weekday() not in DAY_GROUPS[days]:
+            continue
         if kind == "time":
             at = datetime.combine(day, time(minutes // 60, minutes % 60), dt_util.get_default_time_zone())
         else:
@@ -68,5 +82,6 @@ def points_for_day(
             if event is None:
                 continue
             at = dt_util.as_local(event) + timedelta(minutes=minutes)
-        points.append((at, temp, entry_key(kind, minutes)))
+        key = entry_key(kind, minutes)
+        points.append((at, temp, f"{days} {key}" if days else key))
     return sorted(points)

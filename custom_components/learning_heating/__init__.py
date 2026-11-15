@@ -22,8 +22,14 @@ ROOM_SCHEMA = vol.Schema(
     {
         vol.Required("name"): cv.string,
         vol.Required("climate"): cv.entity_id,
-        vol.Required("valve"): cv.entity_id,
-        vol.Required("zone"): cv.string,
+        vol.Optional("valve"): cv.entity_id,
+        vol.Optional("zone"): cv.string,
+        vol.Optional("boost"): cv.entity_id,
+        vol.Optional("power"): vol.Coerce(float),
+        vol.Optional("boost_power"): vol.Coerce(float),
+        vol.Optional("quiet"): vol.Schema(
+            {vol.Required("from"): cv.time, vol.Required("to"): cv.time}
+        ),
         vol.Required("schedule"): validate_schedule,
         vol.Optional("occupied", default=True): cv.boolean,
         vol.Optional("setback"): vol.Coerce(float),
@@ -41,6 +47,7 @@ CONFIG_SCHEMA = vol.Schema(
                 vol.Optional("max_preheat_hours", default=3.0): vol.Coerce(float),
                 vol.Optional("history_days", default=10): cv.positive_int,
                 vol.Optional("people", default=[]): cv.entity_ids,
+                vol.Optional("energy_price"): vol.Coerce(float),
                 vol.Required("rooms"): {cv.slug: ROOM_SCHEMA},
             }
         )
@@ -51,7 +58,12 @@ CONFIG_SCHEMA = vol.Schema(
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     conf = config[DOMAIN]
-    unknown = {room["zone"] for room in conf["rooms"].values()} - set(conf["zones"])
+    rooms = conf["rooms"].values()
+    lopsided = [room["name"] for room in rooms if ("valve" in room) != ("zone" in room)]
+    if lopsided:
+        _LOGGER.error("Rooms need both a valve and a zone, or neither: %s", ", ".join(lopsided))
+        return False
+    unknown = {room["zone"] for room in rooms if "zone" in room} - set(conf["zones"])
     if unknown:
         _LOGGER.error("Rooms refer to undefined zones: %s", ", ".join(sorted(unknown)))
         return False
