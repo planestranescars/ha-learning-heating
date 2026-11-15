@@ -76,6 +76,8 @@ class TargetSensor(_RoomSensor):
             "comfort_adjustments": dict(room.comfort),
             "extra_preheat_minutes": round(room.extra_lead * 60),
             "last_feedback": room.feedback_log[-1]["action"] if room.feedback_log else None,
+            "last_feedback_reply": room.feedback_log[-1].get("reply") if room.feedback_log else None,
+            "last_feedback_at": room.feedback_log[-1].get("pressed") if room.feedback_log else None,
             "feedback_count": len(room.feedback_log),
             "valve_setting": room.setpoint,
             "valve_shuts_above_setting_by": room.shut_gap,

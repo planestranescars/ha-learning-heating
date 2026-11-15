@@ -36,6 +36,9 @@ that takes a target temperature plus a sensor reporting the valve opening.
   target on the right side of the temperature the room was at (too cold at 17.3 °C
   means the target must be above 17.3 °C to bring any heat). A second press within
   10 minutes isn't counted twice.
+- **A reply to every press**: each room's target sensor carries `last_feedback_reply`
+  (what the press changed, in plain words) and `last_feedback_at`, so a dashboard can
+  confirm a press the moment it happens.
 - **Rooms that follow a person**: give a room its own `people` and it ignores everyone
   else: it eases off by 2 °C when they have all been out for 20 minutes, and drops to
   its setback after 2 hours.

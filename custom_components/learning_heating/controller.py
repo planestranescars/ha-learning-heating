@@ -227,6 +227,13 @@ class Room:
         self.floors = dict(data.get("floors", {}))
         self.tried = dict(data.get("tried", {}))
         self.calm_since = data.get("calm_since")
+        # Forget what was learnt about parts of the day the schedule no longer has.
+        known = scheduled_temps(self.schedule)
+        self.comfort = {k: v for k, v in self.comfort.items() if k in known}
+        self.floors = {k: v for k, v in self.floors.items() if k in known}
+        self.tried = {k: v for k, v in self.tried.items() if k in known}
+        if self.trial is not None and self.trial.get("period") not in known:
+            self.trial = None
 
 
 class HeatingController:
@@ -937,6 +944,7 @@ class HeatingController:
         if leftover is not None:
             period = leftover
         offset = room.comfort.get(period, 0.0)
+        lead_before = room.extra_lead
         step = COMFORT_STEP
         scheduled = self._scheduled_at(room, when)
         if leftover is None and temp is not None and scheduled is not None:
@@ -977,7 +985,26 @@ class HeatingController:
         if room.comfort.get(period) == 0.0:
             room.comfort.pop(period)
 
+        # The same thing in plain words, for whoever pressed the button.
+        change = room.comfort.get(period, 0.0) - offset
+        then = "at this time of day" if now - when < REPEAT_PRESS else "at that time of day"
+        if repeat:
+            reply = "Already noted a few minutes ago"
+        elif change and leftover is not None:
+            reply = f"Noted: the earlier, warmer part of the day will be {-change:g}° cooler from now on"
+        elif change:
+            reply = (
+                f"Noted: this room will be {abs(change):g}° "
+                f"{'warmer' if change > 0 else 'cooler'} {then} from now on"
+            )
+        elif room.extra_lead > lead_before:
+            reply = "Noted: this room will start warming up earlier from now on"
+        else:
+            reply = "Noted"
+
         entry = {
+            "pressed": now.isoformat(timespec="seconds"),
+            "reply": reply,
             "time": when.isoformat(timespec="minutes"),
             "feeling": feeling,
             "temperature": temp,
@@ -988,12 +1015,14 @@ class HeatingController:
         await self.async_tick()
         if nudge and room.quiet_window(now):
             entry["action"] = action = f"{action}; nothing changed now, as it is quiet hours"
+            entry["reply"] = f"{reply}. Nothing changes right now, as the heaters are left alone at night"
         elif nudge and room.target is not None:
             held_at = room.target + (nudge if feeling == "too_cold" else -nudge)
             await self._async_hold(room, held_at)
             entry["action"] = action = (
                 f"{action}; set to {room.target:g}°C until {_when(room.override_until)}"
             )
+            entry["reply"] = f"{reply}. Set to {room.target:g}° until {_when(room.override_until)}"
         room.feedback_log = (room.feedback_log + [entry])[-FEEDBACK_LOG_SIZE:]
         _LOGGER.info("%s feedback %s at %s: %s", room.name, feeling, entry["time"], action)
         await self._async_save()
