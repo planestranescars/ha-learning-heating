@@ -20,8 +20,10 @@ that takes a target temperature plus a sensor reporting the valve opening.
 - **Respects manual changes** made at the valve or in Home Assistant until the room's
   next schedule change, including changes made while Home Assistant was restarting.
 - **Comfort feedback**: "too hot" / "too cold" buttons and a service. Too cold while the
-  room was still short of its target makes it start earlier; otherwise the target for
-  that part of the day moves by 0.5 °C.
+  room was still short of its target makes it start earlier. Too hot while the room was
+  already well above its target (heat left over from earlier, e.g. a warm evening at
+  bedtime) lowers that earlier, warmer part of the day. Otherwise the target for that
+  part of the day moves by 0.5 °C. A second press within 10 minutes isn't counted twice.
 
 ## Install
 

@@ -56,6 +56,7 @@ COMFORT_LIMIT = 3.0
 LEAD_STEP_H = 0.5
 MAX_EXTRA_LEAD_H = 3.0
 BEHIND_TARGET = 0.5
+REPEAT_PRESS = timedelta(minutes=10)
 FEEDBACK_LOG_SIZE = 20
 FEEDBACK_MAX_AGE = timedelta(days=2)
 BAD_STATES = (STATE_UNAVAILABLE, STATE_UNKNOWN)
@@ -383,6 +384,21 @@ class HeatingController:
         past = [key for at, _, key in sorted(points) if at <= when]
         return past[-1] if past else None
 
+    def _warmer_period_before(self, room: Room, when: datetime) -> str | None:
+        """The most recent earlier schedule entry that was warmer than the one in force at `when`."""
+        points: list[tuple[datetime, float, str]] = []
+        for offset in (-1, 0):
+            for at, temp, key in points_for_day(self.hass, when.date() + timedelta(days=offset), room.schedule):
+                points.append((at, temp + room.comfort.get(key, 0.0), key))
+        past = [p for p in sorted(points) if p[0] <= when]
+        if len(past) < 2:
+            return None
+        current = past[-1][1]
+        for _, temp, key in reversed(past[:-1]):
+            if temp > current:
+                return key
+        return None
+
     def _decide(self, room: Room, now: datetime) -> None:
         points = self.timeline(room, now)
         past = [p for p in points if p[0] <= now]
@@ -511,9 +527,12 @@ class HeatingController:
         """Learn from 'too hot' / 'too cold' at a moment, now or in the last two days.
 
         Too cold while the room was still short of its target means heating started too
-        late, so the room's warm-up lead grows. Otherwise the target for that part of the
-        day was wrong and is nudged by 0.5C. A non-zero `nudge` also moves the room by
-        that much straight away, held until its next schedule change.
+        late, so the room's warm-up lead grows. Too hot while the room was already well
+        above its target means the heat was left over from an earlier, warmer part of the
+        day, so that part is lowered. Otherwise the target for that part of the day was
+        wrong and is nudged by 0.5C. A second press within a few minutes of the first is
+        not learnt twice. A non-zero `nudge` also moves the room by that much straight
+        away, held until its next schedule change.
         """
         now = dt_util.now()
         if when is None:
@@ -527,9 +546,20 @@ class HeatingController:
         if period is None:
             raise HomeAssistantError(f"{room.name} has no schedule entry before {when}")
 
-        offset = room.comfort.get(period, 0.0)
+        repeat = any(
+            item["feeling"] == feeling
+            and abs(when - datetime.fromisoformat(item["time"])) < REPEAT_PRESS
+            for item in room.feedback_log
+        )
         behind = temp is not None and target is not None and temp < target - BEHIND_TARGET
-        if feeling == "too_cold" and behind and room.extra_lead < MAX_EXTRA_LEAD_H:
+        overshot = temp is not None and target is not None and temp > target + BEHIND_TARGET
+        leftover = self._warmer_period_before(room, when) if feeling == "too_hot" and overshot else None
+        if leftover is not None:
+            period = leftover
+        offset = room.comfort.get(period, 0.0)
+        if repeat:
+            action = "already noted"
+        elif feeling == "too_cold" and behind and room.extra_lead < MAX_EXTRA_LEAD_H:
             room.extra_lead = min(MAX_EXTRA_LEAD_H, room.extra_lead + LEAD_STEP_H)
             action = (
                 f"room was {temp:.1f}C, short of its {target:.1f}C target: "
@@ -541,8 +571,12 @@ class HeatingController:
         else:
             room.comfort[period] = max(-COMFORT_LIMIT, offset - COMFORT_STEP)
             action = f"lowered the {period} target by {room.comfort[period] - offset:+.1f}C"
-            overshot = temp is not None and target is not None and temp > target + BEHIND_TARGET
-            if overshot and room.extra_lead > 0:
+            if leftover is not None:
+                action = (
+                    f"room was {temp:.1f}C, above its {target:.1f}C target, so the heat was left "
+                    f"over from earlier: {action}"
+                )
+            elif overshot and room.extra_lead > 0:
                 room.extra_lead = max(0.0, room.extra_lead - LEAD_STEP_H)
                 action += f"; warm-up lead cut to {round(room.extra_lead * 60)} min"
         if room.comfort.get(period) == 0.0:
