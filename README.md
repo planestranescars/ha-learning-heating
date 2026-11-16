@@ -36,6 +36,12 @@ that takes a target temperature plus a sensor reporting the valve opening.
   target on the right side of the temperature the room was at (too cold at 17.3 °C
   means the target must be above 17.3 °C to bring any heat). A second press within
   10 minutes isn't counted twice.
+- **Hand changes are feedback**: turning a room up or down by hand (on the valve, the
+  panel or the thermostat) says the temperature was not right for that part of the day,
+  so that part moves toward what was chosen, by up to 1.5 °C. A change of more than 3 °C,
+  or one made while pre-heating, coasting or with the room not in use, is not learnt.
+- **Steady pre-heating**: once a room starts pre-heating or coasting it carries on until
+  the schedule change, instead of switching back and forth as the readings move.
 - **A reply to every press**: each room's target sensor carries `last_feedback_reply`
   (what the press changed, in plain words) and `last_feedback_at`, so a dashboard can
   confirm a press the moment it happens.

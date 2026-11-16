@@ -86,6 +86,7 @@ FEEDBACK_MAX_AGE = timedelta(days=2)
 BAD_STATES = (STATE_UNAVAILABLE, STATE_UNKNOWN)
 REASON_VALVE_OFF = "valve switched off by hand"
 REASON_QUIET = "quiet hours"
+HAND_LEARN_REASONS = ("schedule", REASON_QUIET, "manual override")
 
 
 def _round_target(value: float) -> float:
@@ -152,6 +153,7 @@ class Room:
         self.recent_writes: list[tuple[float, datetime]] = []
         self.resume_requested = False
         self.event_at: datetime | None = None
+        self.plan_hold: tuple[str, datetime] | None = None
         self.comfort: dict[str, float] = {}
         self.extra_lead = 0.0
         self.feedback_log: list[dict[str, Any]] = []
@@ -515,7 +517,7 @@ class HeatingController:
             return
         upcoming = [at for at, _ in self.timeline(room, now) if at > now]
         room.override_until = upcoming[0] if upcoming else now + OVERRIDE_FALLBACK
-        self._hand_change(room, now, room.target is not None and target > room.target)
+        self._hand_change(room, now, target, room.target)
         room.target = target
         room.reason = "manual override"
         _LOGGER.info(
@@ -726,11 +728,62 @@ class HeatingController:
             "was too cold; left alone for a month" if failed else "went unnoticed; kept",
         )
 
-    def _hand_change(self, room: Room, now: datetime, warmer: bool) -> None:
-        """Someone changed the room by hand: a sign of discomfort if they turned it up."""
+    def _hand_change(
+        self, room: Room, now: datetime, target: float, before: float | None
+    ) -> None:
+        """Someone changed the room by hand: a sign the temperature was not right.
+
+        The part of the day it happened in moves toward what they chose, by up to 1.5C.
+        A change of more than 3C from the plan is a different need, not a correction,
+        and is not learnt. Changes while pre-heating, coasting, or when the room is
+        not in use say nothing about the schedule.
+        """
         room.calm_since = now.isoformat()
-        if warmer and room.trial is not None and self._period_at(room, now) == room.trial["period"]:
+        period = self._period_at(room, now)
+        if before is not None and target > before and room.trial is not None and period == room.trial["period"]:
             self._end_trial(room, now, failed=True, revert=True)
+        scheduled = self._scheduled_at(room, now)
+        if period is None or scheduled is None or room.reason not in HAND_LEARN_REASONS:
+            return
+        gap = target - scheduled
+        if abs(gap) < COMFORT_STEP or abs(gap) > COMFORT_LIMIT:
+            return
+        feeling = "too_cold" if gap > 0 else "too_hot"
+        if any(
+            item["feeling"] == feeling and item.get("period") == period
+            and abs(now - datetime.fromisoformat(item["time"])) < REPEAT_PRESS
+            for item in room.feedback_log
+        ):
+            return
+        step = math.copysign(min(MAX_FEEDBACK_JUMP, round(abs(gap) * 2) / 2), gap)
+        offset = room.comfort.get(period, 0.0)
+        new = max(-COMFORT_LIMIT, min(COMFORT_LIMIT, offset + step))
+        if new == offset:
+            return
+        room.comfort[period] = new
+        if new == 0.0:
+            room.comfort.pop(period)
+        change = new - offset
+        word = "up" if gap > 0 else "down"
+        entry = {
+            "pressed": now.isoformat(timespec="seconds"),
+            "reply": (
+                f"Noted: you turned it {word} by hand, so this room will be {abs(change):g}° "
+                f"{'warmer' if change > 0 else 'cooler'} at this time of day from now on"
+            ),
+            "time": now.isoformat(timespec="minutes"),
+            "feeling": feeling,
+            "temperature": room.learner.last_temp,
+            "target": scheduled,
+            "period": period,
+            "action": (
+                f"turned {word} by hand to {target:g}C: "
+                f"{'raised' if change > 0 else 'lowered'} the {period} target by {change:+.1f}C"
+            ),
+        }
+        room.feedback_log = (room.feedback_log + [entry])[-FEEDBACK_LOG_SIZE:]
+        self._store.async_delay_save(self._data, SAVE_DELAY_S)
+        _LOGGER.info("%s: %s", room.name, entry["action"])
 
     def _score(self, now: datetime) -> None:
         """Count the hours each room in use spent more than a degree colder than wanted."""
@@ -791,6 +844,24 @@ class HeatingController:
                 if predicted is not None and predicted >= base - COAST_TOLERANCE:
                     target, reason = temp, f"coasting to {at:%H:%M}"
                     room.event_at = at
+
+        # Pre-heating and coasting change the room's temperature, and so the estimate they
+        # were chosen by. Once started they carry on to the schedule change, or the
+        # target would flip back and forth on every reading.
+        if reason != "schedule":
+            room.plan_hold = (reason, room.event_at)
+        elif room.plan_hold is not None:
+            held_reason, held_at = room.plan_hold
+            held_temp = next((t for a, t in upcoming if a == held_at), None)
+            warming = held_reason.startswith("pre-heating")
+            last = learner.last_temp
+            if (
+                held_temp is not None
+                and (held_temp > base if warming else held_temp < base)
+                and (warming or last is None or last >= base - COAST_TOLERANCE - 0.5)
+            ):
+                return held_temp, held_reason
+            room.plan_hold = None
         return target, reason
 
     async def _async_tick(self, _now: datetime | None = None) -> None:
