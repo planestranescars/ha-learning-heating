@@ -31,6 +31,17 @@ ROOM_SCHEMA = vol.Schema(
         vol.Optional("quiet"): vol.Schema(
             {vol.Required("from"): cv.time, vol.Required("to"): cv.time}
         ),
+        vol.Optional("cycle"): vol.Schema(
+            {
+                vol.Optional("heat_target", default=30.0): vol.Coerce(float),
+                vol.Optional("heat_fan", default="high"): cv.string,
+                vol.Optional("purge_fan", default="low"): cv.string,
+                vol.Optional("heat_minutes", default=25): cv.positive_int,
+                vol.Optional("purge_minutes", default=10): cv.positive_int,
+                vol.Optional("lead_minutes", default=180): cv.positive_int,
+                vol.Optional("off_at_or_below", default=12.0): vol.Coerce(float),
+            }
+        ),
         vol.Required("schedule"): validate_schedule,
         vol.Optional("occupied", default=True): cv.boolean,
         vol.Optional("setback"): vol.Coerce(float),

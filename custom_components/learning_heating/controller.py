@@ -57,6 +57,9 @@ MIN_TARGET, MAX_TARGET = 5.0, 30.0
 COMFORT_STEP = 0.5
 COMFORT_LIMIT = 3.0
 MAX_FEEDBACK_JUMP = 1.5
+CYCLE_BAND = 0.5
+CYCLE_SOAK_MIN = 120
+CYCLE_SETTLE = timedelta(seconds=90)
 LEAD_STEP_H = 0.5
 MAX_EXTRA_LEAD_H = 3.0
 BEHIND_TARGET = 0.5
@@ -123,6 +126,14 @@ class Room:
         quiet = conf.get("quiet")
         self.quiet = (quiet["from"], quiet["to"]) if quiet else None
         self.quiet_until: datetime | None = None
+        self.cycle: dict[str, Any] | None = conf.get("cycle")
+        self.cycle_phase: str | None = None
+        self.cycle_since: datetime | None = None
+        self.cycle_trusted = False
+        self.cycle_expect: str | None = None
+        self.cycle_pause_until: datetime | None = None
+        self.true_temp: float | None = None
+        self.true_temp_at: datetime | None = None
         self.boost_wanted: bool | None = None
         self.energy = 0.0
         self.energy_yesterday: float | None = None
@@ -161,6 +172,25 @@ class Room:
     @property
     def summary(self) -> str:
         """What the room is doing, in plain words."""
+        text = self._plan_summary
+        if self.cycle is None or self.cycle_phase is None or self.reason == REASON_VALVE_OFF:
+            return text
+        if self.cycle_pause_until is not None:
+            return f"{text}. Left to you until {_when(self.cycle_pause_until)}"
+        since = self.cycle_since
+        if self.cycle_phase == "heat" and since:
+            end = since + timedelta(minutes=self.cycle["heat_minutes"])
+            return f"{text}. Heating until about {end:%H:%M}, then a fan-only check"
+        if self.cycle_phase == "purge" and since:
+            end = since + timedelta(minutes=self.cycle["purge_minutes"])
+            return f"{text}. Fan only until about {end:%H:%M} to read the room's real temperature"
+        if self.cycle_phase == "idle" and self.true_temp is not None and self.target is not None:
+            if self.target > self.cycle["off_at_or_below"]:
+                return f"{text}. Off: the room is {self.true_temp:g}°"
+        return text
+
+    @property
+    def _plan_summary(self) -> str:
         if self.reason == REASON_VALVE_OFF:
             return "Switched off by hand"
         if self.target is None or self.reason == "starting":
@@ -311,7 +341,7 @@ class HeatingController:
         for room in self.rooms.values():
             state = self.hass.states.get(room.climate)
             temp = _float(state.attributes.get("current_temperature")) if state else None
-            if temp is not None:
+            if temp is not None and not room.cycle:
                 room.learner.observe(now, temp)
 
         climates = {room.climate: room for room in self.rooms.values()}
@@ -499,6 +529,8 @@ class HeatingController:
             return
         temp = _float(new.attributes.get("current_temperature"))
         old_temp = _float(old.attributes.get("current_temperature")) if old else None
+        if room.cycle:
+            return
         if temp is not None and temp != old_temp:
             room.learner.observe(new.last_updated.timestamp(), temp)
             self._store.async_delay_save(self._data, SAVE_DELAY_S)
@@ -827,6 +859,8 @@ class HeatingController:
                 lead = self.max_preheat if need is None else min(
                     self.max_preheat, need * LEAD_MARGIN + LEAD_SLACK_H
                 )
+            elif room.cycle:
+                lead = room.cycle["lead_minutes"] / 60
             else:
                 lead = FALLBACK_LEAD_H
             lead += room.extra_lead
@@ -877,11 +911,14 @@ class HeatingController:
             self._update_presence(now)
             for room in self.rooms.values():
                 self._decide(room, now)
-                if self.enabled:
+                if self.enabled and room.cycle:
+                    await self._async_cycle(room, now)
+                    self._trials(room, now)
+                elif self.enabled:
                     await self._async_apply(room, now)
                     await self._async_boost(room, now)
                     self._trials(room, now)
-                if room.zone is None:
+                if room.zone is None and not room.cycle:
                     room.learner.set_valve(now.timestamp(), self._effective_valve(room))
             self._score(now)
             async_dispatcher_send(self.hass, SIGNAL_UPDATE)
@@ -908,6 +945,104 @@ class HeatingController:
         if not resume and room.last_write and room.last_write[0] == room.setpoint and now - room.last_write[1] < WRITE_RETRY:
             return
         await self._async_write(room, state, now)
+
+    async def _async_cycle(self, room: Room, now: datetime) -> None:
+        """Keep a room warm with a heat pump whose own sensor cannot be trusted.
+
+        The unit's reading follows its own output, and stays high for an hour after it
+        stops. So it heats for a spell, runs the fan alone for a few minutes until the
+        reading is the room's, and heats again only if the room is then too cold. A cold
+        room heats flat out; a warm one is left off.
+        """
+        cycle = room.cycle
+        state = self.hass.states.get(room.climate)
+        if state is None or state.state in BAD_STATES or room.target is None:
+            return
+        resume = room.resume_requested
+        room.resume_requested = False
+        if resume:
+            room.cycle_phase = room.cycle_pause_until = None
+        if room.cycle_pause_until is not None:
+            if now < room.cycle_pause_until:
+                return
+            room.cycle_pause_until = None
+            room.cycle_phase = None
+        if room.cycle_phase == "hand_off":
+            room.reason = REASON_VALVE_OFF
+            return
+        mode = state.state
+        if room.cycle_phase is None:
+            room.cycle_phase = {HVACMode.HEAT: "heat", HVACMode.FAN_ONLY: "purge"}.get(mode, "idle")
+            room.cycle_since = min(now, state.last_changed)
+            room.cycle_expect, room.cycle_trusted = mode, False
+        elif mode != room.cycle_expect and now - room.cycle_since > CYCLE_SETTLE:
+            if mode == HVACMode.OFF:
+                room.cycle_phase = "hand_off"
+                room.reason = REASON_VALVE_OFF
+                _LOGGER.info("%s switched off by hand", room.name)
+                return
+            upcoming = [at for at, _ in self.timeline(room, now) if at > now]
+            room.cycle_pause_until = upcoming[0] if upcoming else now + OVERRIDE_FALLBACK
+            _LOGGER.info("%s changed by hand to %s; left alone until %s", room.name, mode,
+                         room.cycle_pause_until.strftime("%a %H:%M"))
+            return
+        wanted = room.target
+        elapsed = now - room.cycle_since
+        phase = room.cycle_phase
+        if wanted <= cycle["off_at_or_below"]:
+            if phase != "idle":
+                await self._async_cycle_to(room, "idle", now)
+            return
+        slack = timedelta(minutes=1)
+        if phase == "heat":
+            if elapsed + slack >= timedelta(minutes=cycle["heat_minutes"]):
+                await self._async_cycle_to(room, "purge", now)
+            return
+        # After a fan-only check, or after being off long enough, the reading is the room's.
+        if phase == "purge":
+            if elapsed + slack < timedelta(minutes=cycle["purge_minutes"]):
+                return
+        elif not (room.cycle_trusted or elapsed >= timedelta(minutes=CYCLE_SOAK_MIN)):
+            return
+        temp = _float(state.attributes.get("current_temperature"))
+        if temp is None:
+            return
+        room.true_temp, room.true_temp_at = temp, now
+        if temp < wanted - CYCLE_BAND:
+            await self._async_cycle_to(room, "heat", now)
+        elif phase == "purge":
+            await self._async_cycle_to(room, "idle", now)
+
+    async def _async_cycle_to(self, room: Room, phase: str, now: datetime) -> None:
+        cycle = room.cycle
+        entity = {"entity_id": room.climate}
+        calls = {
+            "heat": [
+                ("set_hvac_mode", {"hvac_mode": HVACMode.HEAT}),
+                ("set_fan_mode", {"fan_mode": cycle["heat_fan"]}),
+                ("set_temperature", {ATTR_TEMPERATURE: cycle["heat_target"]}),
+            ],
+            "purge": [
+                ("set_fan_mode", {"fan_mode": cycle["purge_fan"]}),
+                ("set_hvac_mode", {"hvac_mode": HVACMode.FAN_ONLY}),
+            ],
+            "idle": [("set_hvac_mode", {"hvac_mode": HVACMode.OFF})],
+        }[phase]
+        try:
+            for service, data in calls:
+                await self.hass.services.async_call("climate", service, {**entity, **data}, blocking=True)
+        except HomeAssistantError as err:
+            _LOGGER.warning("Could not switch %s to %s: %s", room.name, phase, err)
+            return
+        room.cycle_trusted = phase == "idle" and room.cycle_phase == "purge"
+        room.cycle_phase, room.cycle_since = phase, now
+        room.cycle_expect = {
+            "heat": HVACMode.HEAT, "purge": HVACMode.FAN_ONLY, "idle": HVACMode.OFF,
+        }[phase]
+        _LOGGER.info(
+            "%s: %s (wants %s, room %s)", room.name, phase, room.target,
+            room.true_temp if room.true_temp is not None else "unknown",
+        )
 
     async def _async_boost(self, room: Room, now: datetime) -> None:
         """Run a room's second heater only to help it warm up, and never into quiet hours."""
@@ -1110,7 +1245,7 @@ class HeatingController:
             room.easing = False
             room.reason = "manual override"
             state = self.hass.states.get(room.climate)
-            if self.enabled and state is not None and state.state not in BAD_STATES:
+            if self.enabled and state is not None and state.state not in BAD_STATES and not room.cycle:
                 self._unchecked.discard(room.slug)
                 await self._async_write(room, state, now)
 

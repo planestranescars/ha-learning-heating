@@ -174,6 +174,8 @@ class TemperatureSensor(_RoomSensor):
 
     @property
     def native_value(self) -> float | None:
+        if self.room.cycle:
+            return self.room.true_temp
         return self.room.learner.last_temp
 
 

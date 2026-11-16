@@ -19,6 +19,23 @@ zones:
   annexe: binary_sensor.heating_annexe
 
 rooms:
+  # A heat pump whose own sensor follows its output (see "cycle" in the README):
+  # office:
+  #   name: Office
+  #   climate: climate.office_heat_pump
+  #   setback: 10
+  #   cycle:
+  #     heat_minutes: 25
+  #     purge_minutes: 10
+  #     lead_minutes: 180      # warm-up before the first target of the day
+  #     off_at_or_below: 12    # a target this low keeps the unit off
+  #   schedule:
+  #     weekdays:
+  #       "09:30": 21
+  #       "18:00": 10
+  #     weekends:
+  #       "06:00": 10
+
   lounge:
     name: Lounge
     climate: climate.lounge_trv
