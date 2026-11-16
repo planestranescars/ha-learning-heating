@@ -149,6 +149,7 @@ class Room:
         self.schedule = conf["schedule"]
         self.setback: float = conf.get("setback", default_setback)
         self.occupied: bool = conf["occupied"]
+        self.thermostat: bool = conf["thermostat"]
         self.learner = RoomLearner()
         self.valve_open = 0.0
         self.target: float | None = None
@@ -1258,6 +1259,15 @@ class HeatingController:
         await self._async_save()
         async_dispatcher_send(self.hass, SIGNAL_UPDATE)
         return entry
+
+    async def async_set_target(self, room: Room, temp: float) -> None:
+        """The temperature was asked for on the room's own thermostat: a hand change."""
+        temp = _round_target(temp)
+        if room.target is not None and abs(temp - room.target) < 0.25:
+            return
+        self._hand_change(room, dt_util.now(), temp, room.target)
+        await self._async_hold(room, temp)
+        async_dispatcher_send(self.hass, SIGNAL_UPDATE)
 
     async def _async_hold(self, room: Room, temp: float) -> None:
         """Hold a room at a temperature until its next schedule change, as a manual change would."""

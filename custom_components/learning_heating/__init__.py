@@ -45,6 +45,7 @@ ROOM_SCHEMA = vol.Schema(
         vol.Required("schedule"): validate_schedule,
         vol.Optional("occupied", default=True): cv.boolean,
         vol.Optional("setback"): vol.Coerce(float),
+        vol.Optional("thermostat", default=False): cv.boolean,
     }
 )
 
@@ -83,7 +84,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     controller = HeatingController(hass, conf)
     await controller.async_load()
     hass.data[DOMAIN] = controller
-    for platform in (Platform.SENSOR, Platform.SWITCH, Platform.BUTTON):
+    for platform in (Platform.SENSOR, Platform.SWITCH, Platform.BUTTON, Platform.CLIMATE):
         hass.async_create_task(discovery.async_load_platform(hass, platform, DOMAIN, {}, config))
 
     def room_for(call: ServiceCall):

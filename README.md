@@ -44,6 +44,10 @@ that takes a target temperature plus a sensor reporting the valve opening.
   target at or below `off_at_or_below` keeps the unit off. Turning the unit off by hand
   stops it until resumed; changing its mode by hand leaves it alone until the next
   schedule change. There is no cooling yet.
+- **A thermostat per room** (`thermostat: true`): a climate entity that shows and sets the
+  temperature wanted in the room, apart from whatever is sent to the valve or heater
+  (which may be lower while the room eases off). Setting it holds the room until its
+  next schedule change and counts as a hand change.
 - **Hand changes are feedback**: turning a room up or down by hand (on the valve, the
   panel or the thermostat) says the temperature was not right for that part of the day,
   so that part moves toward what was chosen, by up to 1.5 °C. A change of more than 3 °C,
