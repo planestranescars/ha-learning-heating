@@ -130,6 +130,8 @@ class Room:
         self.cycle_phase: str | None = None
         self.cycle_since: datetime | None = None
         self.cycle_trusted = False
+        self.cycle_lost: datetime | None = None
+        self.cycle_retries = 0
         self.cycle_expect: str | None = None
         self.cycle_pause_until: datetime | None = None
         self.true_temp: float | None = None
@@ -525,6 +527,8 @@ class HeatingController:
     def _on_climate(self, room: Room, event: Event) -> None:
         new: State | None = event.data["new_state"]
         old: State | None = event.data["old_state"]
+        if room.cycle and new is not None and new.state == STATE_UNAVAILABLE:
+            room.cycle_lost = dt_util.now()
         if new is None or new.state in BAD_STATES:
             return
         temp = _float(new.attributes.get("current_temperature"))
@@ -975,7 +979,23 @@ class HeatingController:
             room.cycle_phase = {HVACMode.HEAT: "heat", HVACMode.FAN_ONLY: "purge"}.get(mode, "idle")
             room.cycle_since = min(now, state.last_changed)
             room.cycle_expect, room.cycle_trusted = mode, False
+            if (
+                room.cycle_phase == "idle" and room.target > cycle["off_at_or_below"]
+                and now - room.cycle_since < timedelta(minutes=CYCLE_SOAK_MIN)
+            ):
+                # Off, but perhaps only just: its reading is not to be trusted yet.
+                await self._async_cycle_to(room, "purge", now)
+                return
         elif mode != room.cycle_expect and now - room.cycle_since > CYCLE_SETTLE:
+            lost = room.cycle_lost is not None and room.cycle_lost >= room.cycle_since - CYCLE_SETTLE
+            if (lost or now - room.cycle_since < timedelta(minutes=10)) and room.cycle_retries < 2:
+                # The unit dropped off the network and came back switched off, or ignored the
+                # command: say it again rather than take it for a person at the wall.
+                room.cycle_retries += 1
+                room.cycle_lost = None
+                _LOGGER.warning("%s did not stay in %s; trying again", room.name, room.cycle_phase)
+                await self._async_cycle_to(room, room.cycle_phase, now, keep_trust=True)
+                return
             if mode == HVACMode.OFF:
                 room.cycle_phase = "hand_off"
                 room.reason = REASON_VALVE_OFF
@@ -1013,7 +1033,9 @@ class HeatingController:
         elif phase == "purge":
             await self._async_cycle_to(room, "idle", now)
 
-    async def _async_cycle_to(self, room: Room, phase: str, now: datetime) -> None:
+    async def _async_cycle_to(
+        self, room: Room, phase: str, now: datetime, keep_trust: bool = False
+    ) -> None:
         cycle = room.cycle
         entity = {"entity_id": room.climate}
         calls = {
@@ -1034,7 +1056,9 @@ class HeatingController:
         except HomeAssistantError as err:
             _LOGGER.warning("Could not switch %s to %s: %s", room.name, phase, err)
             return
-        room.cycle_trusted = phase == "idle" and room.cycle_phase == "purge"
+        if not keep_trust:
+            room.cycle_trusted = phase == "idle" and room.cycle_phase == "purge"
+            room.cycle_retries = 0
         room.cycle_phase, room.cycle_since = phase, now
         room.cycle_expect = {
             "heat": HVACMode.HEAT, "purge": HVACMode.FAN_ONLY, "idle": HVACMode.OFF,
