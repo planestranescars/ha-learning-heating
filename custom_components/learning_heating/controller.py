@@ -34,6 +34,8 @@ from .model import RoomLearner
 from .quiet import calling, round_to_step, window
 from .schedule import points_for_day, scheduled_temps
 from .valves import shut_gap
+from .weather import sky as weather_sky
+from .weather import sun_height
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -64,6 +66,19 @@ LEAD_STEP_H = 0.5
 MAX_EXTRA_LEAD_H = 3.0
 MIN_EXTRA_LEAD_H = -2.5
 MIN_LEAD_H = 0.5
+WARM_REACHED = 0.3        # within this of the target counts as having arrived
+EARLY_REACH_H = 0.75      # arriving this early means the warm-up started too soon
+LATE_BY = 0.7             # still this far short at the change means it started too late
+MIN_WATCH = timedelta(minutes=20)
+TIMING_WINDOW_MIN = 90    # a hand change this close to a schedule step says something about it
+TIMING_NEEDED = 3         # consistent signals before a step moves
+TIMING_MIN_SHIFT = 20
+TIMING_STEP = 15
+TIMING_LIMIT = 60
+TIMING_KEEP = timedelta(days=28)
+AUTO_LOG_SIZE = 10
+CYCLE_RATE = 0.1          # degC per minute of heating until learnt
+CYCLE_MIN_HEAT = 8
 BEHIND_TARGET = 0.5
 REPEAT_PRESS = timedelta(minutes=10)
 NORMAL_SHUT_GAP = 1.0
@@ -170,6 +185,13 @@ class Room:
         self.resume_requested = False
         self.event_at: datetime | None = None
         self.plan_hold: tuple[str, datetime] | None = None
+        self.watch: dict[str, Any] | None = None
+        self.time_shift: dict[str, int] = {}
+        self.timing: list[dict[str, Any]] = []
+        self.auto_log: list[dict[str, str]] = []
+        self.cycle_heat_min: float | None = None
+        self.cycle_start: tuple[float, float] | None = None
+        self.cycle_rate: float | None = None
         self.comfort: dict[str, float] = {}
         self.extra_lead = 0.0
         self.feedback_log: list[dict[str, Any]] = []
@@ -184,7 +206,7 @@ class Room:
             return f"{text}. Left to you until {_when(self.cycle_pause_until)}"
         since = self.cycle_since
         if self.cycle_phase == "heat" and since:
-            end = since + timedelta(minutes=self.cycle["heat_minutes"])
+            end = since + timedelta(minutes=self.cycle_heat_min or self.cycle["heat_minutes"])
             return f"{text}. Heating until about {end:%H:%M}, then a fan-only check"
         if self.cycle_phase == "purge" and since:
             end = since + timedelta(minutes=self.cycle["purge_minutes"])
@@ -253,7 +275,8 @@ class Room:
         return {
             "offsets": self.comfort, "extra_lead": self.extra_lead, "log": self.feedback_log,
             "trial": self.trial, "floors": self.floors, "tried": self.tried,
-            "calm_since": self.calm_since,
+            "calm_since": self.calm_since, "time_shift": self.time_shift, "timing": self.timing,
+            "auto_log": self.auto_log, "cycle_rate": self.cycle_rate,
         }
 
     def load_comfort(self, data: dict[str, Any]) -> None:
@@ -264,11 +287,17 @@ class Room:
         self.floors = dict(data.get("floors", {}))
         self.tried = dict(data.get("tried", {}))
         self.calm_since = data.get("calm_since")
+        self.time_shift = {k: int(v) for k, v in data.get("time_shift", {}).items()}
+        self.timing = list(data.get("timing", []))
+        self.auto_log = list(data.get("auto_log", []))
+        self.cycle_rate = data.get("cycle_rate")
         # Forget what was learnt about parts of the day the schedule no longer has.
         known = scheduled_temps(self.schedule)
         self.comfort = {k: v for k, v in self.comfort.items() if k in known}
         self.floors = {k: v for k, v in self.floors.items() if k in known}
         self.tried = {k: v for k, v in self.tried.items() if k in known}
+        self.time_shift = {k: v for k, v in self.time_shift.items() if k in known and v}
+        self.timing = [e for e in self.timing if e.get("key") in known]
         if self.trial is not None and self.trial.get("period") not in known:
             self.trial = None
 
@@ -291,6 +320,8 @@ class HeatingController:
         self.enabled = True
         self.outdoor: float | None = None
         self.forecast: list[tuple[float, float]] = []
+        self.sky: tuple[float, float] = (0.5, 0.0)
+        self.forecast_sky: list[tuple[float, float, float]] = []
         self.warm = False
         self._zone_on: dict[str, bool] = {zone: False for zone in self.zones}
         self._store: Store = Store(hass, 1, f"{DOMAIN}.models")
@@ -409,6 +440,8 @@ class HeatingController:
     def _seed_inputs(self, now: float) -> None:
         weather = self.hass.states.get(self.weather)
         self.outdoor = _float(weather.attributes.get(ATTR_TEMPERATURE)) if weather else None
+        if weather is not None:
+            self.sky = weather_sky(weather.state, weather.attributes)
         for zone, entity in self.zones.items():
             state = self.hass.states.get(entity)
             self._zone_on[zone] = state is not None and state.state == STATE_ON
@@ -418,6 +451,13 @@ class HeatingController:
             if self.outdoor is not None:
                 room.learner.set_outdoor(now, self.outdoor)
             room.learner.set_valve(now, self._effective_valve(room))
+        self._set_sky(now)
+
+    def _set_sky(self, now: float) -> None:
+        clear, wind = self.sky
+        sun = sun_height(self.hass.config.latitude, self.hass.config.longitude, now) * clear
+        for room in self.rooms.values():
+            room.learner.set_sky(now, sun, wind)
 
     # ---- inputs ----------------------------------------------------------
 
@@ -482,8 +522,10 @@ class HeatingController:
         if value is None:
             return
         self.outdoor = value
+        self.sky = weather_sky(new.state, new.attributes)
         for room in self.rooms.values():
             room.learner.set_outdoor(new.last_updated.timestamp(), value)
+        self._set_sky(new.last_updated.timestamp())
 
     @callback
     def _on_person(self, event: Event) -> None:
@@ -578,12 +620,18 @@ class HeatingController:
             _LOGGER.warning("Could not fetch forecast from %s: %s", self.weather, err)
             return
         points = []
+        skies = []
+        current = self.hass.states.get(self.weather)
+        unit = current.attributes.get("wind_speed_unit", "km/h") if current else "km/h"
         for item in (response or {}).get(self.weather, {}).get("forecast", []):
             when = dt_util.parse_datetime(str(item.get("datetime", "")))
             temp = _float(item.get("temperature"))
             if when is not None and temp is not None:
                 points.append((when.timestamp(), temp))
+                clear, wind = weather_sky(item.get("condition"), {**item, "wind_speed_unit": unit})
+                skies.append((when.timestamp(), clear, wind))
         self.forecast = sorted(points)
+        self.forecast_sky = sorted(skies)
 
     # ---- decisions -------------------------------------------------------
 
@@ -603,24 +651,49 @@ class HeatingController:
 
         return outdoor_at
 
+    def _sky_fn(self, now: datetime):
+        """(sun, wind) at a number of hours from now, from the forecast."""
+        start = now.timestamp()
+        current = self.sky
+        points = self.forecast_sky
+        lat, lon = self.hass.config.latitude, self.hass.config.longitude
+
+        def sky_at(hours: float) -> tuple[float, float]:
+            t = start + hours * 3600
+            clear, wind = current
+            for t0, c0, w0 in points:
+                if t0 > t:
+                    break
+                clear, wind = c0, w0
+            return sun_height(lat, lon, t) * clear, wind
+
+        return (lambda h: sky_at(h)[0]), (lambda h: sky_at(h)[1])
+
     def _update_warm(self, now: datetime) -> None:
         outdoor_at = self._outdoor_fn(now)
         mean = sum(outdoor_at(h) for h in range(WARM_WINDOW_H + 1)) / (WARM_WINDOW_H + 1)
         threshold = self.warm_cutoff - WARM_HYSTERESIS if self.warm else self.warm_cutoff
         self.warm = mean > threshold
 
+    def _points(self, room: Room, day) -> list[tuple[datetime, float, str]]:
+        """A day's schedule, with any step the room has learnt to move."""
+        return [
+            (at + timedelta(minutes=room.time_shift.get(key, 0)), temp, key)
+            for at, temp, key in points_for_day(self.hass, day, room.schedule)
+        ]
+
     def timeline(self, room: Room, now: datetime) -> list[tuple[datetime, float]]:
         today = now.date()
         points: list[tuple[datetime, float]] = []
         for offset in (-1, 0, 1, 2):
-            for at, temp, key in points_for_day(self.hass, today + timedelta(days=offset), room.schedule):
+            for at, temp, key in self._points(room, today + timedelta(days=offset)):
                 points.append((at, temp + room.comfort.get(key, 0.0)))
         return sorted(points)
 
     def _period_at(self, room: Room, when: datetime) -> str | None:
         points: list[tuple[datetime, float, str]] = []
         for offset in (-1, 0):
-            points += points_for_day(self.hass, when.date() + timedelta(days=offset), room.schedule)
+            points += self._points(room, when.date() + timedelta(days=offset))
         past = [key for at, _, key in sorted(points) if at <= when]
         return past[-1] if past else None
 
@@ -628,7 +701,7 @@ class HeatingController:
         """The scheduled temperature at a moment, with what feedback has already changed."""
         points: list[tuple[datetime, float, str]] = []
         for offset in (-1, 0):
-            points += points_for_day(self.hass, when.date() + timedelta(days=offset), room.schedule)
+            points += self._points(room, when.date() + timedelta(days=offset))
         past = [(temp, key) for at, temp, key in sorted(points) if at <= when]
         return past[-1][0] + room.comfort.get(past[-1][1], 0.0) if past else None
 
@@ -636,7 +709,7 @@ class HeatingController:
         """The most recent earlier schedule entry that was warmer than the one in force at `when`."""
         points: list[tuple[datetime, float, str]] = []
         for offset in (-1, 0):
-            for at, temp, key in points_for_day(self.hass, when.date() + timedelta(days=offset), room.schedule):
+            for at, temp, key in self._points(room, when.date() + timedelta(days=offset)):
                 points.append((at, temp + room.comfort.get(key, 0.0), key))
         past = [p for p in sorted(points) if p[0] <= when]
         if len(past) < 2:
@@ -778,6 +851,11 @@ class HeatingController:
         not in use say nothing about the schedule.
         """
         room.calm_since = now.isoformat()
+        if (
+            before is not None and abs(target - before) >= COMFORT_STEP
+            and not str(room.reason).startswith("pre-heating")
+        ):
+            self._note_timing(room, now, 1 if target > before else -1)
         period = self._period_at(room, now)
         if before is not None and target > before and room.trial is not None and period == room.trial["period"]:
             self._end_trial(room, now, failed=True, revert=True)
@@ -852,6 +930,7 @@ class HeatingController:
     ) -> tuple[float, str]:
         learner = room.learner
         outdoor_at = self._outdoor_fn(now)
+        sun_at, wind_at = self._sky_fn(now)
         horizon = now + timedelta(hours=max(MIN_LEAD_H, self.max_preheat + room.extra_lead))
         target, reason = base, "schedule"
         room.event_at = None
@@ -862,7 +941,7 @@ class HeatingController:
             if temp <= target:
                 continue
             if learner.reliable:
-                need = learner.hours_to_reach(temp, outdoor_at, self.max_preheat)
+                need = learner.hours_to_reach(temp, outdoor_at, self.max_preheat, sun_at, wind_at)
                 lead = self.max_preheat if need is None else min(
                     self.max_preheat, need * LEAD_MARGIN + LEAD_SLACK_H
                 )
@@ -881,7 +960,7 @@ class HeatingController:
             at, temp = upcoming[0]
             hours = (at - now).total_seconds() / 3600
             if temp < base and hours <= COAST_MAX_H:
-                predicted = learner.predict(hours, 0.0, outdoor_at)
+                predicted = learner.predict(hours, 0.0, outdoor_at, sun_at, wind_at)
                 if predicted is not None and predicted >= base - COAST_TOLERANCE:
                     target, reason = temp, f"coasting to {at:%H:%M}"
                     room.event_at = at
@@ -914,10 +993,12 @@ class HeatingController:
             now = dt_util.now()
             for room in self.rooms.values():
                 room.learner.advance(now.timestamp())
+            self._set_sky(now.timestamp())
             self._update_warm(now)
             self._update_presence(now)
             for room in self.rooms.values():
                 self._decide(room, now)
+                self._watch_warm_up(room, now)
                 if self.enabled and room.cycle:
                     await self._async_cycle(room, now)
                     self._trials(room, now)
@@ -929,6 +1010,63 @@ class HeatingController:
                     room.learner.set_valve(now.timestamp(), self._effective_valve(room))
             self._score(now)
             async_dispatcher_send(self.hass, SIGNAL_UPDATE)
+
+    def _watch_warm_up(self, room: Room, now: datetime) -> None:
+        """Check each warm-up against what happened, and start the next one sooner or later.
+
+        A room that reached its temperature well before it was wanted could have started
+        later; one still short when the change came could have started earlier.
+        """
+        if room.cycle:
+            fresh = room.true_temp_at is not None and now - room.true_temp_at < timedelta(minutes=30)
+            temp = room.true_temp if fresh else None
+        else:
+            temp = room.learner.last_temp
+        watch = room.watch
+        if watch is not None and now >= watch["at"]:
+            room.watch = None
+            self._judge_warm_up(room, now, watch, temp)
+            watch = None
+        if room.override_until is not None or not room.occupied:
+            room.watch = None
+            return
+        if str(room.reason).startswith("pre-heating") and room.event_at is not None:
+            if watch is None or watch["at"] != room.event_at:
+                watch = room.watch = {
+                    "at": room.event_at, "target": room.target, "reached": None, "started": now,
+                }
+            if watch["reached"] is None and temp is not None and room.target is not None \
+                    and temp >= room.target - WARM_REACHED:
+                watch["reached"] = now
+
+    def _judge_warm_up(
+        self, room: Room, now: datetime, watch: dict[str, Any], temp: float | None
+    ) -> None:
+        if watch["at"] - watch["started"] < MIN_WATCH:
+            return
+        reached = watch["reached"]
+        at = watch["at"]
+        if reached is not None:
+            early = (at - reached).total_seconds() / 3600
+            if early >= EARLY_REACH_H and room.extra_lead > MIN_EXTRA_LEAD_H:
+                room.extra_lead = max(MIN_EXTRA_LEAD_H, room.extra_lead - LEAD_STEP_H)
+                self._auto_note(
+                    room, now,
+                    f"it reached {watch['target']:g}° {round(early * 60)} min before {at:%H:%M}, "
+                    f"so warm-up for that change now starts {round(LEAD_STEP_H * 60)} min later",
+                )
+        elif (
+            temp is not None and temp < watch["target"] - LATE_BY and room.extra_lead < MAX_EXTRA_LEAD_H
+        ):
+            room.extra_lead = min(MAX_EXTRA_LEAD_H, room.extra_lead + LEAD_STEP_H)
+            self._auto_note(
+                room, now,
+                f"it was only {temp:g}° at {at:%H:%M}, short of {watch['target']:g}°, "
+                f"so warm-up now starts {round(LEAD_STEP_H * 60)} min earlier",
+            )
+        else:
+            return
+        self._store.async_delay_save(self._data, SAVE_DELAY_S)
 
     async def _async_apply(self, room: Room, now: datetime) -> None:
         if room.override_until is not None or room.target is None or room.quiet_window(now):
@@ -1018,7 +1156,7 @@ class HeatingController:
             return
         slack = timedelta(minutes=1)
         if phase == "heat":
-            if elapsed + slack >= timedelta(minutes=cycle["heat_minutes"]):
+            if elapsed + slack >= timedelta(minutes=room.cycle_heat_min or cycle["heat_minutes"]):
                 await self._async_cycle_to(room, "purge", now)
             return
         # After a fan-only check, or after being off long enough, the reading is the room's.
@@ -1031,10 +1169,28 @@ class HeatingController:
         if temp is None:
             return
         room.true_temp, room.true_temp_at = temp, now
+        if phase == "purge" and room.cycle_start is not None:
+            start_temp, minutes = room.cycle_start
+            room.cycle_start = None
+            rise = temp - start_temp
+            if minutes >= CYCLE_MIN_HEAT and rise >= 0.3:
+                seen = max(0.02, min(0.3, rise / minutes))
+                room.cycle_rate = seen if room.cycle_rate is None else 0.5 * room.cycle_rate + 0.5 * seen
+                self._store.async_delay_save(self._data, SAVE_DELAY_S)
         if temp < wanted - CYCLE_BAND:
             await self._async_cycle_to(room, "heat", now)
         elif phase == "purge":
             await self._async_cycle_to(room, "idle", now)
+
+    def _heat_length(self, room: Room, now: datetime) -> tuple[float, tuple[float, float] | None]:
+        """Minutes to heat: as long as the gap to the target needs at the rate learnt so far."""
+        full = float(room.cycle["heat_minutes"])
+        fresh = room.true_temp_at is not None and now - room.true_temp_at < timedelta(minutes=20)
+        if not fresh or room.true_temp is None or room.target is None:
+            return full, None
+        need = room.target - 0.25 - room.true_temp
+        minutes = max(CYCLE_MIN_HEAT, min(full, need / (room.cycle_rate or CYCLE_RATE)))
+        return minutes, (room.true_temp, minutes)
 
     async def _async_cycle_to(
         self, room: Room, phase: str, now: datetime, keep_trust: bool = False
@@ -1059,6 +1215,8 @@ class HeatingController:
         except HomeAssistantError as err:
             _LOGGER.warning("Could not switch %s to %s: %s", room.name, phase, err)
             return
+        if phase == "heat":
+            room.cycle_heat_min, room.cycle_start = self._heat_length(room, now)
         if not keep_trust:
             room.cycle_trusted = phase == "idle" and room.cycle_phase == "purge"
             room.cycle_retries = 0
@@ -1217,6 +1375,8 @@ class HeatingController:
                 action += f"; warm-up lead cut to {round(room.extra_lead * 60)} min"
         if not repeat:
             room.calm_since = now.isoformat()
+            if not (when >= now - REPEAT_PRESS and str(room.reason).startswith("pre-heating")):
+                self._note_timing(room, when, 1 if feeling == "too_cold" else -1)
             if feeling == "too_cold" and room.trial is not None and room.trial["period"] == period:
                 raised = room.comfort.get(period, 0.0) > offset
                 self._end_trial(room, now, failed=True, revert=not raised)
@@ -1270,6 +1430,69 @@ class HeatingController:
         async_dispatcher_send(self.hass, SIGNAL_UPDATE)
         return entry
 
+    def _note_timing(self, room: Room, when: datetime, direction: int) -> None:
+        """A press or hand change near a schedule step may mean the step is at the wrong time.
+
+        Warming up just before a warmer step, or cooling down just before a cooler one,
+        says the step should come earlier. Doing the opposite of a step just after it
+        says the step should come later. Enough consistent signals move the step.
+        """
+        points = sorted(
+            p for off in (-1, 0, 1) for p in self._points(room, when.date() + timedelta(days=off))
+        )
+        best: tuple[float, str] | None = None
+        for i in range(1, len(points)):
+            at, temp, key = points[i]
+            if temp == points[i - 1][1]:
+                continue
+            step = 1 if temp > points[i - 1][1] else -1
+            gap = (when - at).total_seconds() / 60
+            if abs(gap) > TIMING_WINDOW_MIN:
+                continue
+            if (gap < 0 and direction == step) or (gap > 0 and direction == -step):
+                if best is None or abs(gap) < abs(best[0]):
+                    best = (gap, key)
+        if best is None:
+            return
+        gap, key = best
+        horizon = when - TIMING_KEEP
+        room.timing = [
+            e for e in room.timing if datetime.fromisoformat(e["time"]) > horizon
+        ] + [{"time": when.isoformat(timespec="minutes"), "key": key, "shift": round(gap)}]
+        room.timing = room.timing[-40:]
+        mine = [e["shift"] for e in room.timing if e["key"] == key]
+        if len(mine) < TIMING_NEEDED:
+            return
+        recent = mine[-TIMING_NEEDED:]
+        if not (all(v < 0 for v in recent) or all(v > 0 for v in recent)):
+            return
+        typical = sorted(abs(v) for v in recent)[len(recent) // 2]
+        if typical < TIMING_MIN_SHIFT:
+            return
+        sign = -1 if recent[0] < 0 else 1
+        move = sign * max(TIMING_STEP, round(typical / TIMING_STEP) * TIMING_STEP)
+        current = room.time_shift.get(key, 0)
+        new = max(-TIMING_LIMIT, min(TIMING_LIMIT, current + move))
+        if new == current:
+            return
+        room.time_shift[key] = new
+        if not new:
+            room.time_shift.pop(key)
+        room.timing = [e for e in room.timing if e["key"] != key]
+        name = key.split(" ")[-1]
+        self._auto_note(
+            room, now=when,
+            text=f"the {name} step now comes {abs(new - current)} min {'earlier' if new < current else 'later'}"
+            f" (from {len(recent)} similar hand changes and presses)",
+        )
+
+    def _auto_note(self, room: Room, now: datetime, text: str) -> None:
+        room.auto_log = (
+            room.auto_log + [{"time": now.isoformat(timespec="minutes"), "text": text}]
+        )[-AUTO_LOG_SIZE:]
+        self._store.async_delay_save(self._data, SAVE_DELAY_S)
+        _LOGGER.info("%s: %s", room.name, text)
+
     def _in_warm_up(self, room: Room, when: datetime) -> bool:
         """Was the room, at that moment, in the run-up to a warmer part of the day?"""
         scheduled = self._scheduled_at(room, when)
@@ -1316,6 +1539,9 @@ class HeatingController:
         room.trial = None
         room.floors = {}
         room.tried = {}
+        room.time_shift = {}
+        room.timing = []
+        room.auto_log = []
         await self._async_save()
         await self.async_tick()
 
@@ -1370,11 +1596,18 @@ class HeatingController:
             _LOGGER.exception("Could not read heating history; learning from live data only")
             return
 
-        events: list[tuple[float, str, Any, float]] = []
+        events: list[tuple[float, str, Any, Any]] = []
         for state in weather.get(self.weather, []):
             value = _float(state.attributes.get(ATTR_TEMPERATURE))
             if value is not None:
                 events.append((state.last_updated.timestamp(), "outdoor", None, value))
+                events.append(
+                    (state.last_updated.timestamp(), "sky", None, weather_sky(state.state, state.attributes))
+                )
+        stamp = start.timestamp() if hasattr(start, "timestamp") else float(start)
+        while stamp < end.timestamp():
+            events.append((stamp, "skytick", None, None))
+            stamp += 1800
         for entity, zone in zone_entities.items():
             for state in states.get(entity, []):
                 if state.state not in BAD_STATES:
@@ -1396,8 +1629,16 @@ class HeatingController:
         zone_on = dict.fromkeys(self.zones, False)
         valve = {room.slug: 0.0 for room in rooms}
         last_temp: dict[str, float] = {}
+        history_sky = self.sky
+        lat, lon = self.hass.config.latitude, self.hass.config.longitude
         for when, kind, key, value in events:
-            if kind == "outdoor":
+            if kind == "sky":
+                history_sky = value
+            if kind in ("sky", "skytick"):
+                sun = sun_height(lat, lon, when) * history_sky[0]
+                for learner in learners.values():
+                    learner.set_sky(when, sun, history_sky[1])
+            elif kind == "outdoor":
                 for learner in learners.values():
                     learner.set_outdoor(when, value)
             elif kind == "zone":
@@ -1417,6 +1658,9 @@ class HeatingController:
             learner = learners[room.slug]
             if self.outdoor is not None:
                 learner.set_outdoor(now, self.outdoor)
+            learner.set_sky(
+                now, sun_height(lat, lon, now) * self.sky[0], self.sky[1]
+            )
             learner.set_valve(now, self._effective_valve(room))
             room.learner = learner
             best = learner.model

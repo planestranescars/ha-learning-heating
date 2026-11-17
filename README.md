@@ -43,7 +43,20 @@ that takes a target temperature plus a sensor reporting the valve opening.
   below target. A cold room warms up in repeated spells; a warm one is left off. A
   target at or below `off_at_or_below` keeps the unit off. Turning the unit off by hand
   stops it until resumed; changing its mode by hand leaves it alone until the next
-  schedule change. There is no cooling yet.
+  schedule change. Each heating spell lasts only as long as the gap to the target needs,
+  at the warm-up rate learnt so far, so a room close to target is not overshot.
+  There is no cooling yet.
+- **Warm-ups tune themselves**: each warm-up is checked against what happened. A room
+  that reached its temperature 45 minutes or more before it was wanted starts 30 minutes
+  later next time; one still more than 0.7 °C short starts 30 minutes earlier. Each change
+  is reported on the target sensor as `last_auto_change`.
+- **Schedule times that move**: if a room is turned up, or reported too cold, shortly before
+  a warmer step (or turned down shortly before a cooler one) three times running, that
+  step moves earlier; the opposite just after a step moves it later. Steps move 15 minutes
+  at a time, by at most an hour, and the shift is shown as `schedule_shifts`.
+- **Sun and wind**: the thermal model also learns how much each room warms in sunshine
+  and how much extra heat a breeze takes from it, using the weather entity's condition,
+  cloud cover and wind, and the forecast of them when planning a warm-up.
 - **Warm-up that can start later**: too hot during the run-up to a warmer part of the day
   moves that room's warm-up start 30 minutes later (too cold while still short of target
   moves it earlier), instead of changing the temperature wanted.
