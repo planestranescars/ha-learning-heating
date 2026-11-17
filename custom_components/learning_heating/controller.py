@@ -1129,7 +1129,7 @@ class HeatingController:
                 return
         elif mode != room.cycle_expect and now - room.cycle_since > CYCLE_SETTLE:
             lost = room.cycle_lost is not None and room.cycle_lost >= room.cycle_since - CYCLE_SETTLE
-            if (lost or now - room.cycle_since < timedelta(minutes=10)) and room.cycle_retries < 2:
+            if lost and room.cycle_retries < 2:
                 # The unit dropped off the network and came back switched off, or ignored the
                 # command: say it again rather than take it for a person at the wall.
                 room.cycle_retries += 1
@@ -1547,6 +1547,8 @@ class HeatingController:
 
     async def _async_conditions_at(self, room: Room, when: datetime) -> tuple[float | None, float | None]:
         """Valve-reported temperature and setpoint at a moment."""
+        if room.cycle:
+            return room.true_temp, room.target
         if dt_util.now() - when < timedelta(minutes=10):
             state = self.hass.states.get(room.climate)
             estimate = room.learner.estimate
