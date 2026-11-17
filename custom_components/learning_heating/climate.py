@@ -49,6 +49,7 @@ class RoomThermostat(ClimateEntity):
         self.room = room
         self._attr_name = f"{room.name} thermostat"
         self._attr_unique_id = f"{DOMAIN}_{room.slug}_thermostat"
+        self.entity_id = f"climate.{room.slug}_thermostat"
 
     async def async_added_to_hass(self) -> None:
         self.async_on_remove(

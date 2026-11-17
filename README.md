@@ -44,6 +44,9 @@ that takes a target temperature plus a sensor reporting the valve opening.
   target at or below `off_at_or_below` keeps the unit off. Turning the unit off by hand
   stops it until resumed; changing its mode by hand leaves it alone until the next
   schedule change. There is no cooling yet.
+- **Warm-up that can start later**: too hot during the run-up to a warmer part of the day
+  moves that room's warm-up start 30 minutes later (too cold while still short of target
+  moves it earlier), instead of changing the temperature wanted.
 - **A thermostat per room** (`thermostat: true`): a climate entity that shows and sets the
   temperature wanted in the room, apart from whatever is sent to the valve or heater
   (which may be lower while the room eases off). Setting it holds the room until its

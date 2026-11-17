@@ -62,6 +62,8 @@ CYCLE_SOAK_MIN = 120
 CYCLE_SETTLE = timedelta(seconds=90)
 LEAD_STEP_H = 0.5
 MAX_EXTRA_LEAD_H = 3.0
+MIN_EXTRA_LEAD_H = -2.5
+MIN_LEAD_H = 0.5
 BEHIND_TARGET = 0.5
 REPEAT_PRESS = timedelta(minutes=10)
 NORMAL_SHUT_GAP = 1.0
@@ -850,7 +852,7 @@ class HeatingController:
     ) -> tuple[float, str]:
         learner = room.learner
         outdoor_at = self._outdoor_fn(now)
-        horizon = now + timedelta(hours=self.max_preheat + room.extra_lead)
+        horizon = now + timedelta(hours=max(MIN_LEAD_H, self.max_preheat + room.extra_lead))
         target, reason = base, "schedule"
         room.event_at = None
 
@@ -868,7 +870,7 @@ class HeatingController:
                 lead = room.cycle["lead_minutes"] / 60
             else:
                 lead = FALLBACK_LEAD_H
-            lead += room.extra_lead
+            lead = max(MIN_LEAD_H, lead + room.extra_lead)
             if room.lead_hours is None:
                 room.lead_hours = lead
             if now >= at - timedelta(hours=lead):
@@ -1183,6 +1185,12 @@ class HeatingController:
             step = max(step, min(MAX_FEEDBACK_JUMP, math.ceil((gap + COMFORT_STEP) * 2) / 2))
         if repeat:
             action = "already noted"
+        elif feeling == "too_hot" and self._in_warm_up(room, when) and room.extra_lead > MIN_EXTRA_LEAD_H:
+            room.extra_lead = max(MIN_EXTRA_LEAD_H, room.extra_lead - LEAD_STEP_H)
+            action = (
+                f"too warm while warming up for the next change: "
+                f"now starts heating {round(LEAD_STEP_H * 60)} min later"
+            )
         elif feeling == "too_cold" and behind and room.extra_lead < MAX_EXTRA_LEAD_H:
             room.extra_lead = min(MAX_EXTRA_LEAD_H, room.extra_lead + LEAD_STEP_H)
             action = (
@@ -1230,6 +1238,8 @@ class HeatingController:
             )
         elif room.extra_lead > lead_before:
             reply = "Noted: this room will start warming up earlier from now on"
+        elif room.extra_lead < lead_before:
+            reply = "Noted: this room will start warming up later from now on"
         else:
             reply = "Noted"
 
@@ -1259,6 +1269,15 @@ class HeatingController:
         await self._async_save()
         async_dispatcher_send(self.hass, SIGNAL_UPDATE)
         return entry
+
+    def _in_warm_up(self, room: Room, when: datetime) -> bool:
+        """Was the room, at that moment, in the run-up to a warmer part of the day?"""
+        scheduled = self._scheduled_at(room, when)
+        following = [(at, temp) for at, temp in self.timeline(room, when) if at > when][:1]
+        if scheduled is None or not following or following[0][1] <= scheduled:
+            return False
+        lead = room.lead_hours if room.lead_hours is not None else FALLBACK_LEAD_H
+        return following[0][0] - when <= timedelta(hours=lead)
 
     async def async_set_target(self, room: Room, temp: float) -> None:
         """The temperature was asked for on the room's own thermostat: a hand change."""
