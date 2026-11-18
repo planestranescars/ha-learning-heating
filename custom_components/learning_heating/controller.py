@@ -30,6 +30,7 @@ from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN, SIGNAL_UPDATE
+from .levels import LevelLearner
 from .model import RoomLearner
 from .quiet import calling, round_to_step, window
 from .schedule import points_for_day, scheduled_temps
@@ -81,6 +82,7 @@ CYCLE_RATE = 0.1          # degC per minute of heating until learnt
 CYCLE_MIN_HEAT = 8
 SENSOR_STALE = timedelta(minutes=15)
 COAST_DEFAULT = 0.3
+SENSED_BAND = 0.3     # a room with its own sensor heats again this far below target
 COAST_WATCH = timedelta(minutes=30)
 BEHIND_TARGET = 0.5
 REPEAT_PRESS = timedelta(minutes=10)
@@ -110,6 +112,17 @@ BAD_STATES = (STATE_UNAVAILABLE, STATE_UNKNOWN)
 REASON_VALVE_OFF = "valve switched off by hand"
 REASON_QUIET = "quiet hours"
 HAND_LEARN_REASONS = ("schedule", REASON_QUIET, "manual override")
+
+
+GENTLE_LEVELS = (("low", 24.0), ("low", 26.0), ("medium", 28.0))
+
+
+def cycle_levels(cycle: dict[str, Any] | None) -> list[tuple[str, float]]:
+    """Outputs a heat pump room can run at, gentlest first; the configured one is the top."""
+    if not cycle:
+        return []
+    top = (cycle["heat_fan"], float(cycle["heat_target"]))
+    return [level for level in GENTLE_LEVELS if level[1] < top[1]] + [top]
 
 
 def _round_target(value: float) -> float:
@@ -199,6 +212,10 @@ class Room:
         self.cycle_coast: float | None = None
         self.coast_watch: tuple[float, datetime, float] | None = None
         self.cycle_lock = asyncio.Lock()
+        self.levels = LevelLearner(len(cycle_levels(self.cycle))) if self.cycle else None
+        self.cycle_level: int | None = None
+        self.cycle_level_since: datetime | None = None
+        self.spell: dict[str, Any] | None = None
         self.comfort: dict[str, float] = {}
         self.extra_lead = 0.0
         self.feedback_log: list[dict[str, Any]] = []
@@ -213,7 +230,13 @@ class Room:
             return f"{text}. Left to you until {_when(self.cycle_pause_until)}"
         since = self.cycle_since
         if self.cycle_phase == "heat" and self.sensor and self.true_temp is not None:
-            return f"{text}. Heating: the room is {self.true_temp:g}°"
+            if self.cycle_level is not None and self.levels is not None:
+                fan, setting = cycle_levels(self.cycle)[self.cycle_level]
+                return (
+                    f"{text}. Heating at output {self.cycle_level + 1} of {self.levels.count} "
+                    f"({fan} fan, {setting:g}°): the room is {self.true_temp:.1f}°"
+                )
+            return f"{text}. Heating: the room is {self.true_temp:.1f}°"
         if self.cycle_phase == "heat" and since:
             end = since + timedelta(minutes=self.cycle_heat_min or self.cycle["heat_minutes"])
             return f"{text}. Heating until about {end:%H:%M}, then a fan-only check"
@@ -222,7 +245,7 @@ class Room:
             return f"{text}. Fan only until about {end:%H:%M} to read the room's real temperature"
         if self.cycle_phase == "idle" and self.true_temp is not None and self.target is not None:
             if self.target > self.cycle["off_at_or_below"]:
-                return f"{text}. Off: the room is {self.true_temp:g}°"
+                return f"{text}. Off: the room is {self.true_temp:.1f}°"
         return text
 
     @property
@@ -287,6 +310,7 @@ class Room:
             "calm_since": self.calm_since, "time_shift": self.time_shift, "timing": self.timing,
             "auto_log": self.auto_log, "cycle_rate": self.cycle_rate,
             "cycle_coast": self.cycle_coast,
+            "levels": self.levels.as_dict() if self.levels else None,
         }
 
     def load_comfort(self, data: dict[str, Any]) -> None:
@@ -302,6 +326,8 @@ class Room:
         self.auto_log = list(data.get("auto_log", []))
         self.cycle_rate = data.get("cycle_rate")
         self.cycle_coast = data.get("cycle_coast")
+        if self.levels is not None:
+            self.levels.load(data.get("levels"))
         # Forget what was learnt about parts of the day the schedule no longer has.
         known = scheduled_temps(self.schedule)
         self.comfort = {k: v for k, v in self.comfort.items() if k in known}
@@ -1194,7 +1220,10 @@ class HeatingController:
                 room.cycle_retries += 1
                 room.cycle_lost = None
                 _LOGGER.warning("%s did not stay in %s; trying again", room.name, room.cycle_phase)
-                await self._async_cycle_to(room, room.cycle_phase, now, keep_trust=True)
+                await self._async_cycle_to(
+                    room, room.cycle_phase, now, keep_trust=True,
+                    heat=self._level_setting(room, room.cycle_level),
+                )
                 return
             if mode == HVACMode.OFF:
                 room.cycle_phase = "hand_off"
@@ -1258,13 +1287,62 @@ class HeatingController:
         if phase == "heat":
             ran = now - room.cycle_since >= timedelta(minutes=CYCLE_MIN_HEAT)
             if ran and temp + coast >= wanted:
+                self._spell_done(room, now)
                 await self._async_cycle_to(room, "idle", now)
                 room.coast_watch = (temp, now, temp)
-        elif temp < wanted - CYCLE_BAND:
+                return
+            level, since = room.cycle_level, room.cycle_level_since
+            if level is not None and since is not None and room.levels is not None:
+                minutes = (now - since).total_seconds() / 60
+                if room.levels.step_up(level, minutes, temp + coast < wanted):
+                    await self._async_set_level(room, level + 1, now)
+        elif temp < wanted - SENSED_BAND:
             self._learn_coast(room, now, temp, done=True)
-            await self._async_cycle_to(room, "heat", now)
+            level, warm_up = (
+                room.levels.start(self.outdoor, wanted - temp) if room.levels else (None, False)
+            )
+            await self._async_cycle_to(room, "heat", now, heat=self._level_setting(room, level))
+            if room.cycle_phase == "heat":
+                room.cycle_level, room.cycle_level_since = level, now
+                room.spell = {"start": level, "warm_up": warm_up}
         elif phase == "purge":
             await self._async_cycle_to(room, "idle", now)
+
+    def _level_setting(self, room: Room, level: int | None) -> tuple[str, float] | None:
+        levels = cycle_levels(room.cycle)
+        return levels[level] if level is not None and 0 <= level < len(levels) else None
+
+    async def _async_set_level(self, room: Room, level: int, now: datetime) -> None:
+        """Change how hard the unit runs without stopping it."""
+        setting = self._level_setting(room, level)
+        if setting is None:
+            return
+        fan, target = setting
+        entity = {"entity_id": room.climate}
+        try:
+            await self.hass.services.async_call(
+                "climate", "set_fan_mode", {**entity, "fan_mode": fan}, blocking=True
+            )
+            await self.hass.services.async_call(
+                "climate", "set_temperature", {**entity, ATTR_TEMPERATURE: target}, blocking=True
+            )
+        except HomeAssistantError as err:
+            _LOGGER.warning("Could not change %s output: %s", room.name, err)
+            return
+        room.cycle_level, room.cycle_level_since = level, now
+        _LOGGER.info("%s: more output, %s fan at %s", room.name, fan, target)
+
+    def _spell_done(self, room: Room, now: datetime) -> None:
+        """Learn from a spell of heat how hard to run next time in this weather."""
+        spell, room.spell = room.spell, None
+        level, room.cycle_level = room.cycle_level, None
+        if spell is None or level is None or room.levels is None or room.cycle_since is None:
+            return
+        minutes = (now - room.cycle_since).total_seconds() / 60
+        note = room.levels.spell_done(self.outdoor, spell["start"], level, minutes, spell["warm_up"])
+        if note:
+            self._auto_note(room, now, note)
+        self._store.async_delay_save(self._data, SAVE_DELAY_S)
 
     def _learn_coast(self, room: Room, now: datetime, temp: float, done: bool = False) -> None:
         """How far the room still rises once the unit stops heating."""
@@ -1293,15 +1371,17 @@ class HeatingController:
         return minutes, (room.true_temp, minutes)
 
     async def _async_cycle_to(
-        self, room: Room, phase: str, now: datetime, keep_trust: bool = False
+        self, room: Room, phase: str, now: datetime, keep_trust: bool = False,
+        heat: tuple[str, float] | None = None,
     ) -> None:
         cycle = room.cycle
         entity = {"entity_id": room.climate}
+        fan, setting = heat or (cycle["heat_fan"], cycle["heat_target"])
         calls = {
             "heat": [
                 ("set_hvac_mode", {"hvac_mode": HVACMode.HEAT}),
-                ("set_fan_mode", {"fan_mode": cycle["heat_fan"]}),
-                ("set_temperature", {ATTR_TEMPERATURE: cycle["heat_target"]}),
+                ("set_fan_mode", {"fan_mode": fan}),
+                ("set_temperature", {ATTR_TEMPERATURE: setting}),
             ],
             "purge": [
                 ("set_fan_mode", {"fan_mode": cycle["purge_fan"]}),
