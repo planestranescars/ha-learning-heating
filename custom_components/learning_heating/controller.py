@@ -311,6 +311,10 @@ class Room:
             "auto_log": self.auto_log, "cycle_rate": self.cycle_rate,
             "cycle_coast": self.cycle_coast,
             "levels": self.levels.as_dict() if self.levels else None,
+            "hold": (
+                {"until": self.override_until.isoformat(), "target": self.target}
+                if self.override_until is not None and self.target is not None else None
+            ),
         }
 
     def load_comfort(self, data: dict[str, Any]) -> None:
@@ -328,6 +332,13 @@ class Room:
         self.cycle_coast = data.get("cycle_coast")
         if self.levels is not None:
             self.levels.load(data.get("levels"))
+        # A temperature set by hand outlives a restart.
+        hold = data.get("hold") or {}
+        until = dt_util.parse_datetime(hold.get("until") or "")
+        if until is not None and until > dt_util.now() and hold.get("target") is not None:
+            self.override_until = until
+            self.target = self.setpoint = float(hold["target"])
+            self.reason = "manual override"
         # Forget what was learnt about parts of the day the schedule no longer has.
         known = scheduled_temps(self.schedule)
         self.comfort = {k: v for k, v in self.comfort.items() if k in known}
@@ -684,6 +695,7 @@ class HeatingController:
         self._hand_change(room, now, target, room.target)
         room.target = target
         room.reason = "manual override"
+        self._store.async_delay_save(self._data, SAVE_DELAY_S)
         _LOGGER.info(
             "%s set to %.1f outside the controller; holding until %s",
             room.name, target, room.override_until.strftime("%a %H:%M"),
@@ -1700,6 +1712,7 @@ class HeatingController:
             room.target = room.setpoint = _round_target(temp)
             room.easing = False
             room.reason = "manual override"
+            self._store.async_delay_save(self._data, SAVE_DELAY_S)
             state = self.hass.states.get(room.climate)
             if self.enabled and state is not None and state.state not in BAD_STATES and not room.cycle:
                 self._unchecked.discard(room.slug)
