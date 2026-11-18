@@ -78,6 +78,7 @@ class TargetSensor(_RoomSensor):
             "last_feedback": room.feedback_log[-1]["action"] if room.feedback_log else None,
             "last_auto_change": room.auto_log[-1] if room.auto_log else None,
             "schedule_shifts": dict(room.time_shift),
+            "rise_after_heat_c": room.cycle_coast,
             "last_feedback_reply": room.feedback_log[-1].get("reply") if room.feedback_log else None,
             "last_feedback_at": room.feedback_log[-1].get("pressed") if room.feedback_log else None,
             "feedback_count": len(room.feedback_log),

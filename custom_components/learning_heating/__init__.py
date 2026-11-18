@@ -22,6 +22,7 @@ ROOM_SCHEMA = vol.Schema(
     {
         vol.Required("name"): cv.string,
         vol.Required("climate"): cv.entity_id,
+        vol.Optional("sensor"): cv.entity_id,
         vol.Optional("valve"): cv.entity_id,
         vol.Optional("zone"): cv.string,
         vol.Optional("boost"): cv.entity_id,

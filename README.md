@@ -46,6 +46,13 @@ that takes a target temperature plus a sensor reporting the valve opening.
   schedule change. Each heating spell lasts only as long as the gap to the target needs,
   at the warm-up rate learnt so far, so a room close to target is not overshot.
   There is no cooling yet.
+- **A room thermometer of its own**: give a room `sensor:` (any temperature sensor) and
+  that reading is used as the room's temperature and for learning, instead of the
+  heating unit's own. A heat-pump room with a sensor needs no fan-only checks: it heats
+  until the room, plus the rise still to come after the unit stops, reaches the target.
+  That rise is learnt by watching the room after each spell, and shown as
+  `rise_after_heat_c`. If the sensor stops reporting for 15 minutes the room falls back
+  to fan-only checks.
 - **Warm-ups tune themselves**: each warm-up is checked against what happened. A room
   that reached its temperature 45 minutes or more before it was wanted starts 30 minutes
   later next time; one still more than 0.7 °C short starts 30 minutes earlier. Each change

@@ -79,6 +79,9 @@ TIMING_KEEP = timedelta(days=28)
 AUTO_LOG_SIZE = 10
 CYCLE_RATE = 0.1          # degC per minute of heating until learnt
 CYCLE_MIN_HEAT = 8
+SENSOR_STALE = timedelta(minutes=15)
+COAST_DEFAULT = 0.3
+COAST_WATCH = timedelta(minutes=30)
 BEHIND_TARGET = 0.5
 REPEAT_PRESS = timedelta(minutes=10)
 NORMAL_SHUT_GAP = 1.0
@@ -135,6 +138,7 @@ class Room:
         self.slug = slug
         self.name: str = conf["name"]
         self.climate: str = conf["climate"]
+        self.sensor: str | None = conf.get("sensor")
         self.valve: str | None = conf.get("valve")
         self.zone: str | None = conf.get("zone")
         self.boost: str | None = conf.get("boost")
@@ -192,6 +196,9 @@ class Room:
         self.cycle_heat_min: float | None = None
         self.cycle_start: tuple[float, float] | None = None
         self.cycle_rate: float | None = None
+        self.cycle_coast: float | None = None
+        self.coast_watch: tuple[float, datetime, float] | None = None
+        self.cycle_lock = asyncio.Lock()
         self.comfort: dict[str, float] = {}
         self.extra_lead = 0.0
         self.feedback_log: list[dict[str, Any]] = []
@@ -205,6 +212,8 @@ class Room:
         if self.cycle_pause_until is not None:
             return f"{text}. Left to you until {_when(self.cycle_pause_until)}"
         since = self.cycle_since
+        if self.cycle_phase == "heat" and self.sensor and self.true_temp is not None:
+            return f"{text}. Heating: the room is {self.true_temp:g}°"
         if self.cycle_phase == "heat" and since:
             end = since + timedelta(minutes=self.cycle_heat_min or self.cycle["heat_minutes"])
             return f"{text}. Heating until about {end:%H:%M}, then a fan-only check"
@@ -277,6 +286,7 @@ class Room:
             "trial": self.trial, "floors": self.floors, "tried": self.tried,
             "calm_since": self.calm_since, "time_shift": self.time_shift, "timing": self.timing,
             "auto_log": self.auto_log, "cycle_rate": self.cycle_rate,
+            "cycle_coast": self.cycle_coast,
         }
 
     def load_comfort(self, data: dict[str, Any]) -> None:
@@ -291,6 +301,7 @@ class Room:
         self.timing = list(data.get("timing", []))
         self.auto_log = list(data.get("auto_log", []))
         self.cycle_rate = data.get("cycle_rate")
+        self.cycle_coast = data.get("cycle_coast")
         # Forget what was learnt about parts of the day the schedule no longer has.
         known = scheduled_temps(self.schedule)
         self.comfort = {k: v for k, v in self.comfort.items() if k in known}
@@ -377,7 +388,13 @@ class HeatingController:
         for room in self.rooms.values():
             state = self.hass.states.get(room.climate)
             temp = _float(state.attributes.get("current_temperature")) if state else None
-            if temp is not None and not room.cycle:
+            if room.sensor:
+                sensed = self.hass.states.get(room.sensor)
+                temp = _float(sensed.state) if sensed is not None else None
+                if temp is not None:
+                    room.true_temp, room.true_temp_at = temp, dt_util.now()
+                    room.learner.observe(now, temp)
+            elif temp is not None and not room.cycle:
                 room.learner.observe(now, temp)
 
         climates = {room.climate: room for room in self.rooms.values()}
@@ -390,6 +407,9 @@ class HeatingController:
         zones = {entity: zone for zone, entity in self.zones.items()}
         track = partial(async_track_state_change_event, self.hass)
         track(list(climates), callback(lambda e: self._on_climate(climates[e.data["entity_id"]], e)))
+        sensors = {room.sensor: room for room in self.rooms.values() if room.sensor}
+        if sensors:
+            track(list(sensors), callback(lambda e: self._on_sensor(sensors[e.data["entity_id"]], e)))
         track(list(valves), callback(lambda e: self._on_valve(valves[e.data["entity_id"]], e)))
         track(list(heaters), callback(lambda e: self._on_heater(heaters[e.data["entity_id"]], e)))
         track(list(zones), callback(lambda e: self._on_zone(zones[e.data["entity_id"]], e)))
@@ -569,6 +589,43 @@ class HeatingController:
         return (None if quiet and out < long_away else out), long_away
 
     @callback
+    def _on_sensor(self, room: Room, event: Event) -> None:
+        """A room thermometer of its own: the temperature the room is really at."""
+        new: State | None = event.data["new_state"]
+        if new is None or new.state in BAD_STATES:
+            return
+        temp = _float(new.state)
+        if temp is None:
+            return
+        room.true_temp, room.true_temp_at = temp, dt_util.now()
+        room.learner.observe(new.last_updated.timestamp(), temp)
+        self._store.async_delay_save(self._data, SAVE_DELAY_S)
+        async_dispatcher_send(self.hass, SIGNAL_UPDATE)
+        if room.cycle and self._ticking and self.enabled and room.target is not None:
+            # React to the room as it changes rather than at the next tick.
+            self.hass.async_create_task(self._async_cycle_now(room))
+
+    async def _async_cycle_now(self, room: Room) -> None:
+        if room.cycle_lock.locked():
+            return
+        async with room.cycle_lock:
+            await self._async_cycle(room, dt_util.now())
+        async_dispatcher_send(self.hass, SIGNAL_UPDATE)
+
+    def _sensor_reading(self, room: Room, now: datetime) -> float | None:
+        """The room thermometer's reading, if it has one that is still reporting."""
+        if room.sensor is None:
+            return None
+        state = self.hass.states.get(room.sensor)
+        if state is None or state.state in BAD_STATES:
+            return None
+        value = _float(state.state)
+        seen = getattr(state, "last_reported", None) or state.last_updated
+        if value is None or now - seen > SENSOR_STALE:
+            return None
+        return value
+
+    @callback
     def _on_climate(self, room: Room, event: Event) -> None:
         new: State | None = event.data["new_state"]
         old: State | None = event.data["old_state"]
@@ -580,7 +637,7 @@ class HeatingController:
         old_temp = _float(old.attributes.get("current_temperature")) if old else None
         if room.cycle:
             return
-        if temp is not None and temp != old_temp:
+        if temp is not None and temp != old_temp and not room.sensor:
             room.learner.observe(new.last_updated.timestamp(), temp)
             self._store.async_delay_save(self._data, SAVE_DELAY_S)
             async_dispatcher_send(self.hass, SIGNAL_UPDATE)
@@ -1000,7 +1057,8 @@ class HeatingController:
                 self._decide(room, now)
                 self._watch_warm_up(room, now)
                 if self.enabled and room.cycle:
-                    await self._async_cycle(room, now)
+                    async with room.cycle_lock:
+                        await self._async_cycle(room, now)
                     self._trials(room, now)
                 elif self.enabled:
                     await self._async_apply(room, now)
@@ -1123,6 +1181,7 @@ class HeatingController:
             if (
                 room.cycle_phase == "idle" and room.target > cycle["off_at_or_below"]
                 and now - room.cycle_since < timedelta(minutes=CYCLE_SOAK_MIN)
+                and self._sensor_reading(room, now) is None
             ):
                 # Off, but perhaps only just: its reading is not to be trusted yet.
                 await self._async_cycle_to(room, "purge", now)
@@ -1154,6 +1213,10 @@ class HeatingController:
             if phase != "idle":
                 await self._async_cycle_to(room, "idle", now)
             return
+        sensed = self._sensor_reading(room, now)
+        if sensed is not None:
+            await self._async_cycle_sensed(room, now, sensed)
+            return
         slack = timedelta(minutes=1)
         if phase == "heat":
             if elapsed + slack >= timedelta(minutes=room.cycle_heat_min or cycle["heat_minutes"]):
@@ -1181,6 +1244,43 @@ class HeatingController:
             await self._async_cycle_to(room, "heat", now)
         elif phase == "purge":
             await self._async_cycle_to(room, "idle", now)
+
+    async def _async_cycle_sensed(self, room: Room, now: datetime, temp: float) -> None:
+        """With a thermometer in the room no fan-only checks are needed.
+
+        Heat until the room plus the rise still to come after the unit stops reaches the
+        target; that rise is learnt by watching the room after each spell of heat.
+        """
+        wanted = room.target
+        phase = room.cycle_phase
+        self._learn_coast(room, now, temp)
+        coast = room.cycle_coast if room.cycle_coast is not None else COAST_DEFAULT
+        if phase == "heat":
+            ran = now - room.cycle_since >= timedelta(minutes=CYCLE_MIN_HEAT)
+            if ran and temp + coast >= wanted:
+                await self._async_cycle_to(room, "idle", now)
+                room.coast_watch = (temp, now, temp)
+        elif temp < wanted - CYCLE_BAND:
+            self._learn_coast(room, now, temp, done=True)
+            await self._async_cycle_to(room, "heat", now)
+        elif phase == "purge":
+            await self._async_cycle_to(room, "idle", now)
+
+    def _learn_coast(self, room: Room, now: datetime, temp: float, done: bool = False) -> None:
+        """How far the room still rises once the unit stops heating."""
+        watch = room.coast_watch
+        if watch is None:
+            return
+        at_stop, since, peak = watch
+        peak = max(peak, temp)
+        if not done and now - since < COAST_WATCH and room.cycle_phase == "idle":
+            room.coast_watch = (at_stop, since, peak)
+            return
+        room.coast_watch = None
+        seen = max(0.0, min(2.0, peak - at_stop))
+        room.cycle_coast = seen if room.cycle_coast is None else 0.5 * room.cycle_coast + 0.5 * seen
+        self._auto_note(room, now, f"rises {room.cycle_coast:.1f}° after the heat stops")
+        self._store.async_delay_save(self._data, SAVE_DELAY_S)
 
     def _heat_length(self, room: Room, now: datetime) -> tuple[float, tuple[float, float] | None]:
         """Minutes to heat: as long as the gap to the target needs at the rate learnt so far."""
