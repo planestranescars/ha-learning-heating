@@ -112,11 +112,16 @@ that takes a target temperature plus a sensor reporting the valve opening.
   set for the schedule as it stands when quiet hours begin, the boost heater is
   switched off, and both are left alone until quiet hours end. Schedule changes that
   fall inside quiet hours wait until they end, so put the bedtime entry before `from`.
+- **Gentle bedroom warm-ups**: a radiator valve in a room marked `bedroom: true` is not
+  opened flat out to warm up. It is set only 1 °C above the room's temperature, rising
+  with it, so the radiator runs warm rather than hot beside someone still asleep. How
+  far above is learnt from the night answers below (`gentle_warm_up_c`).
 - **How the night was**: mark rooms `bedroom: true` and each gets three buttons, last
-  night too cold / fine / too warm, which can be pressed at any time that day. Too warm
-  after heating that came on while people were asleep (more than 30 minutes before the
-  morning step) makes it come on 30 minutes later; otherwise the night's temperature
-  comes down 0.5 °C. Too cold with the room still short at the morning step makes it
+  night too cold / fine / too warm, which can be pressed at any time that day. The
+  latest answer about a night is the one that counts. Too warm after heating that came
+  on while people were asleep (more than 30 minutes before the morning step) makes a
+  bedroom's warm-up gentler, down to 0.5 °C above the room, then makes it come on 30
+  minutes later; otherwise the night's temperature comes down 0.5 °C. Too cold with the room still short at the morning step makes it
   warm up 30 minutes earlier; otherwise the night's temperature goes up 0.5 °C. With
   `night_check`, each person listed is asked on their phone each morning (at `at`, while
   they are not away) about the bedroom they sleep in, shown and changed with

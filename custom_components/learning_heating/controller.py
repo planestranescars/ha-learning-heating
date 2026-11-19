@@ -111,6 +111,10 @@ BOOST_GAP = 2.0
 DEFAULT_HEATER_W = 1000.0
 FEEDBACK_LOG_SIZE = 20
 FEEDBACK_MAX_AGE = timedelta(days=2)
+# A bedroom warms up gently: its valve is set only this far above the room, rising with
+# it, so the radiator runs warm rather than flat out beside someone still asleep.
+RAMP_AHEAD = 1.0
+RAMP_MIN, RAMP_MAX, RAMP_STEP = 0.5, 3.0, 0.5
 NIGHT_HOUR = 3            # "last night" is judged by the schedule in force at 03:00
 NIGHT_EARLY = timedelta(minutes=30)  # a warm-up begun this long before the morning step ran while asleep
 BAD_STATES = (STATE_UNAVAILABLE, STATE_UNKNOWN)
@@ -162,6 +166,7 @@ class Room:
         self.bedroom: bool = conf.get("bedroom", False)
         self.warm_up_started: str | None = None   # when the last warm-up began
         self.last_reply: dict[str, str] | None = None   # the reply to the latest press
+        self.ramp_ahead: float = RAMP_AHEAD   # how far above the room a bedroom warm-up sets the valve
         self.valve: str | None = conf.get("valve")
         self.zone: str | None = conf.get("zone")
         self.boost: str | None = conf.get("boost")
@@ -320,6 +325,7 @@ class Room:
             "calm_since": self.calm_since, "time_shift": self.time_shift, "timing": self.timing,
             "auto_log": self.auto_log, "cycle_rate": self.cycle_rate,
             "cycle_coast": self.cycle_coast, "warm_up_started": self.warm_up_started,
+            "ramp_ahead": self.ramp_ahead,
             "levels": self.levels.as_dict() if self.levels else None,
             "hold": (
                 {"until": self.override_until.isoformat(), "target": self.target}
@@ -341,6 +347,7 @@ class Room:
         self.cycle_rate = data.get("cycle_rate")
         self.cycle_coast = data.get("cycle_coast")
         self.warm_up_started = data.get("warm_up_started")
+        self.ramp_ahead = float(data.get("ramp_ahead", RAMP_AHEAD))
         if self.levels is not None:
             self.levels.load(data.get("levels"))
         # A temperature set by hand outlives a restart.
@@ -874,8 +881,17 @@ class HeatingController:
         if room.target is not None:
             step = _float(state.attributes.get("target_temp_step"))
             room.setpoint = round_to_step(room.target, step)
-        correction = room.valve_correction
         temp = _float(state.attributes.get("current_temperature"))
+        if (
+            room.bedroom and room.zone is not None and room.target is not None
+            and str(room.reason).startswith("pre-heating")
+        ):
+            now_temp = room.learner.estimate if room.learner.estimate is not None else temp
+            if now_temp is not None:
+                floor = room.wanted if room.wanted is not None else now_temp
+                gentle = min(room.target, max(floor, now_temp + room.ramp_ahead))
+                room.setpoint = round_to_step(gentle, _float(state.attributes.get("target_temp_step")))
+        correction = room.valve_correction
         if room.target is None or not correction or temp is None:
             room.easing = False
             return
@@ -1684,6 +1700,8 @@ class HeatingController:
                     room.comfort.pop(undo["period"], None)
             if "lead" in undo:
                 room.extra_lead = undo["lead"]
+            if "ramp" in undo:
+                room.ramp_ahead = undo["ramp"]
             room.feedback_log = [i for i in room.feedback_log if i is not earlier]
             undone = "the earlier answer is undone"
         if feeling == "fine":
@@ -1699,9 +1717,23 @@ class HeatingController:
         started = await self._async_warm_up_began(room, night, morning)
         early_start = morning is not None and started is not None and started < morning - NIGHT_EARLY
         offset = room.comfort.get(period, 0.0)
-        undo = {"period": period, "offset": offset, "lead": room.extra_lead}
+        undo = {"period": period, "offset": offset, "lead": room.extra_lead, "ramp": room.ramp_ahead}
         minutes = round(LEAD_STEP_H * 60)
-        if feeling == "too_hot" and early_start and room.extra_lead > MIN_EXTRA_LEAD_H:
+        if (
+            feeling == "too_hot" and early_start and room.bedroom and room.zone is not None
+            and room.ramp_ahead > RAMP_MIN
+        ):
+            room.ramp_ahead = max(RAMP_MIN, room.ramp_ahead - RAMP_STEP)
+            began = f"{dt_util.as_local(started):%H:%M}"
+            action = (
+                f"too warm overnight; warm-up began at {began}: valve now kept "
+                f"{room.ramp_ahead:g}C above the room while warming"
+            )
+            reply = (
+                f"the heating came on at {began}; from now on the radiator warms up more gently "
+                f"(set {room.ramp_ahead:g}° above the room instead of full on)"
+            )
+        elif feeling == "too_hot" and early_start and room.extra_lead > MIN_EXTRA_LEAD_H:
             room.extra_lead = max(MIN_EXTRA_LEAD_H, room.extra_lead - LEAD_STEP_H)
             began = f"{dt_util.as_local(started):%H:%M}"
             action = f"too warm overnight; warm-up began at {began}: now starts {minutes} min later"
