@@ -21,8 +21,9 @@ that takes a target temperature plus a sensor reporting the valve opening.
   next schedule change, including changes made while Home Assistant was restarting.
 - **Corrects valves that won't shut**: learns from history how far above its setpoint
   each valve stops calling for heat (needs a `valve` attribute on the climate entity).
-  A valve that stays open several degrees above its setpoint is sent a lower number
-  once the room is warm enough, so it stops holding its zone and the boiler on.
+  A valve that stays open more than 1.5 °C above its setpoint is sent a lower number
+  once the room is warm enough, so it stops holding its zone and the boiler on, and a
+  bedroom is not kept warmer than wanted all night.
 - **Keeps score**: `sensor.heating_cold_room_hours_today` counts the hours rooms in use
   spent more than 1 °C colder than wanted, to weigh against heating run time.
 - **Presence**: list `people` and, once all of them have been out for 20 minutes, rooms
@@ -65,9 +66,11 @@ that takes a target temperature plus a sensor reporting the valve opening.
   1.5 °C or more below target, as at the start of a warm-up, gets full output. It heats
   again 0.3 °C below target, and a spell lasts at least 5 minutes. The current and learnt outputs are shown as `output_level`
   and `output_levels_learnt`.
-- **Warm-ups tune themselves**: each warm-up is checked against what happened. A room
-  that reached its temperature 45 minutes or more before it was wanted starts 30 minutes
-  later next time; one still more than 0.7 °C short starts 30 minutes earlier. Each change
+- **Warm-ups tune themselves**: a warm-up aims to arrive on time rather than early (a
+  bedroom warming while people are still asleep wakes them; a little short at the change
+  does less harm). Each one is checked against what happened. A room that reached its
+  temperature 15 minutes or more before it was wanted starts that much later next time;
+  one still more than 0.7 °C short starts 30 minutes earlier. Each change
   is reported on the target sensor as `last_auto_change`.
 - **Schedule times that move**: if a room is turned up, or reported too cold, shortly before
   a warmer step (or turned down shortly before a cooler one) three times running, that

@@ -49,8 +49,10 @@ WRITE_RETRY = timedelta(minutes=10)
 OWN_WRITE_WINDOW = timedelta(minutes=15)
 OVERRIDE_FALLBACK = timedelta(hours=4)
 FALLBACK_LEAD_H = 1.0
-LEAD_MARGIN = 1.2
-LEAD_SLACK_H = 0.25
+# A warm-up aims to arrive on time, not early: a room warming while people are still
+# asleep wakes them, and a little short at the change does less harm.
+LEAD_MARGIN = 1.0
+LEAD_SLACK_H = 0.0
 COAST_MAX_H = 1.0
 COAST_TOLERANCE = 0.5
 WARM_WINDOW_H = 3
@@ -68,7 +70,7 @@ MAX_EXTRA_LEAD_H = 3.0
 MIN_EXTRA_LEAD_H = -2.5
 MIN_LEAD_H = 0.5
 WARM_REACHED = 0.3        # within this of the target counts as having arrived
-EARLY_REACH_H = 0.75      # arriving this early means the warm-up started too soon
+EARLY_REACH_H = 0.25      # arriving this early means the warm-up started too soon
 LATE_BY = 0.7             # still this far short at the change means it started too late
 MIN_WATCH = timedelta(minutes=20)
 TIMING_WINDOW_MIN = 90    # a hand change this close to a schedule step says something about it
@@ -88,7 +90,7 @@ COAST_WATCH = timedelta(minutes=30)
 BEHIND_TARGET = 0.5
 REPEAT_PRESS = timedelta(minutes=10)
 NORMAL_SHUT_GAP = 1.0
-MIN_VALVE_CORRECTION = 1.5
+MIN_VALVE_CORRECTION = 0.5
 MAX_VALVE_CORRECTION = 4.0
 EASING_EXIT = 0.5
 VALVE_LEARN_INTERVAL = timedelta(hours=24)
@@ -1154,11 +1156,12 @@ class HeatingController:
         if reached is not None:
             early = (at - reached).total_seconds() / 3600
             if early >= EARLY_REACH_H and room.extra_lead > MIN_EXTRA_LEAD_H:
-                room.extra_lead = max(MIN_EXTRA_LEAD_H, room.extra_lead - LEAD_STEP_H)
+                before = room.extra_lead
+                room.extra_lead = max(MIN_EXTRA_LEAD_H, room.extra_lead - round(early * 12) / 12)
                 self._auto_note(
                     room, now,
                     f"it reached {watch['target']:g}° {round(early * 60)} min before {at:%H:%M}, "
-                    f"so warm-up for that change now starts {round(LEAD_STEP_H * 60)} min later",
+                    f"so warm-up for that change now starts {round((before - room.extra_lead) * 60)} min later",
                 )
         elif (
             temp is not None and temp < watch["target"] - LATE_BY and room.extra_lead < MAX_EXTRA_LEAD_H
