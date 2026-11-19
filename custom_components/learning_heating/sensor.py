@@ -83,8 +83,8 @@ class TargetSensor(_RoomSensor):
             "output_levels_learnt": (
                 {k: v + 1 for k, v in room.levels.table.items()} if room.levels else None
             ),
-            "last_feedback_reply": room.feedback_log[-1].get("reply") if room.feedback_log else None,
-            "last_feedback_at": room.feedback_log[-1].get("pressed") if room.feedback_log else None,
+            "last_feedback_reply": _reply(room)[0],
+            "last_feedback_at": _reply(room)[1],
             "feedback_count": len(room.feedback_log),
             "valve_setting": room.setpoint,
             "valve_shuts_above_setting_by": room.shut_gap,
@@ -217,3 +217,13 @@ class WarmUpSensor(_RoomSensor):
             "no_change_error_c": round(naive**0.5, 2) if naive is not None else None,
             "reliable": learner.reliable,
         }
+
+
+def _reply(room: Room) -> tuple[str | None, str | None]:
+    """The reply to the latest press, night answers included."""
+    logged = room.feedback_log[-1] if room.feedback_log else None
+    candidates = [r for r in (room.last_reply, logged) if r and r.get("pressed")]
+    if not candidates:
+        return None, None
+    latest = max(candidates, key=lambda r: r["pressed"])
+    return latest.get("reply"), latest["pressed"]

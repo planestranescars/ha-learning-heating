@@ -161,6 +161,7 @@ class Room:
         self.sensor: str | None = conf.get("sensor")
         self.bedroom: bool = conf.get("bedroom", False)
         self.warm_up_started: str | None = None   # when the last warm-up began
+        self.last_reply: dict[str, str] | None = None   # the reply to the latest press
         self.valve: str | None = conf.get("valve")
         self.zone: str | None = conf.get("zone")
         self.boost: str | None = conf.get("boost")
@@ -1654,45 +1655,61 @@ class HeatingController:
     async def async_night_feedback(self, room: Room, feeling: str) -> dict[str, Any]:
         """Learn from how last night was in a bedroom.
 
-        Too hot after a warm-up that began while people were still asleep means it began
-        too soon, so it starts later; otherwise the room was kept too warm overnight and
-        the night's temperature comes down. Too cold with the room still short when the
-        morning step came means the warm-up began too late; otherwise the night's
+        Too hot after heating that came on while people were still asleep means it came
+        on too soon, so it comes on later; otherwise the room was kept too warm overnight
+        and the night's temperature comes down. Too cold with the room still short when
+        the morning step came means the warm-up began too late; otherwise the night's
         temperature goes up. "Fine" changes nothing.
+
+        The latest answer about a night is the one that counts: a different answer
+        undoes what the earlier one changed, and the same answer again changes nothing.
         """
         now = dt_util.now()
         local = dt_util.as_local(now)
         night = local.replace(hour=NIGHT_HOUR, minute=0, second=0, microsecond=0)
         if local < night:
             night -= timedelta(days=1)
+        key = night.date().isoformat()
+        label = {"too_hot": "Too warm", "too_cold": "Too cold", "fine": "Fine"}[feeling]
+        earlier = next((i for i in reversed(room.feedback_log) if i.get("night") == key), None)
+        if earlier is not None and earlier["feeling"] == feeling:
+            return self._night_reply(room, now, key, feeling, f"{label}: already noted. {earlier['reply']}")
+        undone = ""
+        if earlier is not None:
+            undo = earlier.get("undo") or {}
+            if undo.get("period"):
+                if undo.get("offset"):
+                    room.comfort[undo["period"]] = undo["offset"]
+                else:
+                    room.comfort.pop(undo["period"], None)
+            if "lead" in undo:
+                room.extra_lead = undo["lead"]
+            room.feedback_log = [i for i in room.feedback_log if i is not earlier]
+            undone = "the earlier answer is undone"
         if feeling == "fine":
-            return {"night": night.date().isoformat(), "feeling": feeling, "reply": "Thanks, noted"}
+            reply = f"Fine: thanks, {undone}" if undone else "Fine: thanks, nothing to change"
+            entry = self._night_reply(room, now, key, feeling, reply)
+            await self._async_night_done(room)
+            return entry
+
         period = self._period_at(room, night)
         if period is None:
             raise HomeAssistantError(f"{room.name} has no schedule entry for the night")
         morning = next((at for at, _ in self.timeline(room, night) if at > night), None)
-        started = dt_util.parse_datetime(room.warm_up_started or "")
-        early_start = (
-            morning is not None and started is not None
-            and night - timedelta(hours=6) < started < morning - NIGHT_EARLY
-        )
-        repeat = any(
-            item.get("night") == night.date().isoformat() and item["feeling"] == feeling
-            for item in room.feedback_log
-        )
+        started = await self._async_warm_up_began(room, night, morning)
+        early_start = morning is not None and started is not None and started < morning - NIGHT_EARLY
         offset = room.comfort.get(period, 0.0)
+        undo = {"period": period, "offset": offset, "lead": room.extra_lead}
         minutes = round(LEAD_STEP_H * 60)
-        if repeat:
-            action = reply = "Already noted for last night"
-        elif feeling == "too_hot" and early_start and room.extra_lead > MIN_EXTRA_LEAD_H:
+        if feeling == "too_hot" and early_start and room.extra_lead > MIN_EXTRA_LEAD_H:
             room.extra_lead = max(MIN_EXTRA_LEAD_H, room.extra_lead - LEAD_STEP_H)
             began = f"{dt_util.as_local(started):%H:%M}"
             action = f"too warm overnight; warm-up began at {began}: now starts {minutes} min later"
-            reply = f"Noted: the heating came on at {began}; from now on it comes on {minutes} min later"
+            reply = f"the heating came on at {began}; from now on it comes on {minutes} min later"
         elif feeling == "too_hot":
             room.comfort[period] = max(-COMFORT_LIMIT, offset - COMFORT_STEP)
             action = f"too warm overnight: lowered the {period} target by {room.comfort[period] - offset:+.1f}C"
-            reply = f"Noted: this room will be {COMFORT_STEP:g}° cooler at night from now on"
+            reply = f"this room will be {COMFORT_STEP:g}° cooler at night from now on"
         else:
             temp = target = None
             if morning is not None and morning <= now:
@@ -1704,33 +1721,67 @@ class HeatingController:
                 room.extra_lead = min(MAX_EXTRA_LEAD_H, room.extra_lead + LEAD_STEP_H)
                 at = f"{dt_util.as_local(morning):%H:%M}"
                 action = f"too cold overnight; only {temp:.1f}C at {at}: warm-up now starts {minutes} min earlier"
-                reply = f"Noted: it was only {temp:.1f}° at {at}; from now on it warms up {minutes} min earlier"
+                reply = f"it was only {temp:.1f}° at {at}; from now on it warms up {minutes} min earlier"
             else:
                 room.comfort[period] = min(COMFORT_LIMIT, offset + COMFORT_STEP)
                 action = f"too cold overnight: raised the {period} target by {room.comfort[period] - offset:+.1f}C"
-                reply = f"Noted: this room will be {COMFORT_STEP:g}° warmer at night from now on"
-            if not repeat and room.trial is not None and room.trial["period"] == period:
+                reply = f"this room will be {COMFORT_STEP:g}° warmer at night from now on"
+            if room.trial is not None and room.trial["period"] == period:
                 self._end_trial(room, now, failed=True, revert=room.comfort.get(period, 0.0) <= offset)
                 action += "; stopped trying less heat here for a month"
         if room.comfort.get(period) == 0.0:
             room.comfort.pop(period)
-        entry = {
-            "pressed": now.isoformat(timespec="seconds"),
-            "reply": reply,
-            "time": night.isoformat(timespec="minutes"),
-            "night": night.date().isoformat(),
-            "feeling": feeling,
-            "period": period,
-            "action": action,
-        }
-        if not repeat:
-            room.calm_since = now.isoformat()
-            room.feedback_log = (room.feedback_log + [entry])[-FEEDBACK_LOG_SIZE:]
-            _LOGGER.info("%s night feedback %s: %s", room.name, feeling, action)
+        reply = f"{label}: " + (f"{undone}, and " if undone else "noted, ") + reply
+        entry = self._night_reply(room, now, key, feeling, reply)
+        entry.update({
+            "time": night.isoformat(timespec="minutes"), "period": period,
+            "action": action, "undo": undo,
+        })
+        room.calm_since = now.isoformat()
+        room.feedback_log = (room.feedback_log + [entry])[-FEEDBACK_LOG_SIZE:]
+        _LOGGER.info("%s night feedback %s: %s", room.name, feeling, action)
+        await self._async_night_done(room)
+        return entry
+
+    def _night_reply(
+        self, room: Room, now: datetime, key: str, feeling: str, reply: str
+    ) -> dict[str, Any]:
+        room.last_reply = {"reply": reply, "pressed": now.isoformat(timespec="seconds")}
+        return {"pressed": now.isoformat(timespec="seconds"), "night": key, "feeling": feeling, "reply": reply}
+
+    async def _async_night_done(self, room: Room) -> None:
         await self.async_tick()
         await self._async_save()
         async_dispatcher_send(self.hass, SIGNAL_UPDATE)
-        return entry
+
+    async def _async_warm_up_began(
+        self, room: Room, night: datetime, morning: datetime | None
+    ) -> datetime | None:
+        """When the heating came on for the morning: the first rise of a degree or more in
+        what the heater was set to after midnight, from history, or the last warm-up noted."""
+        if morning is None:
+            return None
+        start = night - timedelta(hours=NIGHT_HOUR)
+        try:
+            states = await get_instance(self.hass).async_add_executor_job(
+                partial(
+                    history.get_significant_states, self.hass, start, morning,
+                    entity_ids=[room.climate], significant_changes_only=True,
+                )
+            )
+        except Exception:  # noqa: BLE001 - history only sharpens the answer
+            states = {}
+        first = None
+        for state in states.get(room.climate, []):
+            value = _float(state.attributes.get(ATTR_TEMPERATURE))
+            if value is None:
+                continue
+            if first is None:
+                first = value
+            elif value >= first + 1.0:
+                return state.last_updated
+        noted = dt_util.parse_datetime(room.warm_up_started or "")
+        return noted if noted is not None and start < noted < morning else None
 
     def _note_timing(self, room: Room, when: datetime, direction: int) -> None:
         """A press or hand change near a schedule step may mean the step is at the wrong time.

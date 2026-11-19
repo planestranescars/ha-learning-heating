@@ -45,11 +45,13 @@ class Sleeper:
         self.settled = False
         self.asked: str | None = None
         self.answered: str | None = None
+        self.last_answer: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "room": self.room, "good": self.good, "ignored": self.ignored,
             "settled": self.settled, "asked": self.asked, "answered": self.answered,
+            "last_answer": self.last_answer,
         }
 
     def load(self, data: dict[str, Any], bedrooms: list[str]) -> None:
@@ -60,6 +62,7 @@ class Sleeper:
         self.settled = bool(data.get("settled", False))
         self.asked = data.get("asked")
         self.answered = data.get("answered")
+        self.last_answer = data.get("last_answer")
 
     def unsettle(self) -> None:
         self.settled = False
@@ -178,9 +181,13 @@ class NightCheck:
             if sleeper.room != slug:
                 sleeper.room = slug
                 sleeper.unsettle()
+            counted = sleeper.answered == self._today() and sleeper.last_answer == "fine"
             sleeper.answered = self._today()
+            sleeper.last_answer = answer
             sleeper.ignored = 0
-            if answer == "fine":
+            if answer != "fine" and counted:
+                sleeper.good = max(0, sleeper.good - 1)
+            if answer == "fine" and not counted:
                 sleeper.good += 1
                 if sleeper.good >= GOOD_NIGHTS and not sleeper.settled:
                     sleeper.settled = True
