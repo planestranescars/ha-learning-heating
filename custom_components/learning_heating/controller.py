@@ -80,7 +80,7 @@ TIMING_KEEP = timedelta(days=28)
 AUTO_LOG_SIZE = 10
 CYCLE_RATE = 0.1          # degC per minute of heating until learnt
 CYCLE_MIN_HEAT = 8
-SENSOR_STALE = timedelta(minutes=15)
+SENSOR_STALE = timedelta(hours=6)  # a steady reading is not reported again, so be patient
 COAST_DEFAULT = 0.3
 SENSED_BAND = 0.3     # a room with its own sensor heats again this far below target
 SENSED_MIN_HEAT = 5   # ...and needs no longer a minimum spell than this
@@ -1311,15 +1311,17 @@ class HeatingController:
                 minutes = (now - since).total_seconds() / 60
                 if room.levels.step_up(level, minutes, temp + coast < wanted):
                     await self._async_set_level(room, level + 1, now)
-        elif temp < wanted - SENSED_BAND:
+        elif temp < wanted - SENSED_BAND and not (
+            room.coast_watch is not None and temp >= room.coast_watch[0]
+        ):
             self._learn_coast(room, now, temp, done=True)
             level, warm_up = (
                 room.levels.start(self.outdoor, wanted - temp) if room.levels else (None, False)
             )
-            await self._async_cycle_to(room, "heat", now, heat=self._level_setting(room, level))
-            if room.cycle_phase == "heat":
-                room.cycle_level, room.cycle_level_since = level, now
-                room.spell = {"start": level, "warm_up": warm_up}
+            await self._async_cycle_to(
+                room, "heat", now, heat=self._level_setting(room, level), level=level,
+                spell={"start": level, "warm_up": warm_up} if level is not None else None,
+            )
         elif phase == "purge":
             await self._async_cycle_to(room, "idle", now)
 
@@ -1390,7 +1392,8 @@ class HeatingController:
 
     async def _async_cycle_to(
         self, room: Room, phase: str, now: datetime, keep_trust: bool = False,
-        heat: tuple[str, float] | None = None,
+        heat: tuple[str, float] | None = None, level: int | None = None,
+        spell: dict[str, Any] | None = None,
     ) -> None:
         cycle = room.cycle
         entity = {"entity_id": room.climate}
@@ -1416,6 +1419,10 @@ class HeatingController:
         if phase == "heat":
             room.cycle_heat_min, room.cycle_start = self._heat_length(room, now)
         if not keep_trust:
+            room.cycle_level, room.cycle_level_since = level, now
+            room.spell = spell if phase == "heat" else None
+            if phase != "heat":
+                room.cycle_level = None
             room.cycle_trusted = phase == "idle" and room.cycle_phase == "purge"
             room.cycle_retries = 0
         room.cycle_phase, room.cycle_since = phase, now
