@@ -1078,6 +1078,7 @@ class HeatingController:
                 and (held_temp > base if warming else held_temp < base)
                 and (warming or last is None or last >= base - COAST_TOLERANCE - 0.5)
             ):
+                room.event_at = held_at
                 return held_temp, held_reason
             room.plan_hold = None
         return target, reason
@@ -1121,6 +1122,10 @@ class HeatingController:
             temp = room.true_temp if fresh else None
         else:
             temp = room.learner.last_temp
+        seen = room.true_temp_at if room.cycle else (
+            None if room.learner.last_temp_time is None
+            else dt_util.utc_from_timestamp(room.learner.last_temp_time)
+        )
         watch = room.watch
         if watch is not None and now >= watch["at"]:
             room.watch = None
@@ -1135,6 +1140,7 @@ class HeatingController:
                     "at": room.event_at, "target": room.target, "reached": None, "started": now,
                 }
             if watch["reached"] is None and temp is not None and room.target is not None \
+                    and seen is not None and seen > watch["started"] \
                     and temp >= room.target - WARM_REACHED:
                 watch["reached"] = now
 
