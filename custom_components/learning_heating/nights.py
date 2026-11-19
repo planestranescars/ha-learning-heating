@@ -128,7 +128,7 @@ class NightCheck:
             domain, service = "notify", domain
         data: dict[str, Any] = {
             "tag": f"{DOMAIN}_night_{sleeper.person.replace('.', '_')}",
-            "channel": "Heating", "importance": "low",
+            "channel": "Heating", "importance": "default",
         }
         if ask:
             data["actions"] = [

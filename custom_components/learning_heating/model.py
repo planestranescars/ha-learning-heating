@@ -308,6 +308,10 @@ class RoomLearner:
     def last_temp(self) -> float | None:
         return self.trackers[0].last_temp
 
+    @property
+    def last_temp_time(self) -> float | None:
+        return self.trackers[0].last_temp_time
+
     def advance(self, now: float) -> None:
         for t in self.trackers:
             t.advance(now)
