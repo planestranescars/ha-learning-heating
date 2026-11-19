@@ -9,6 +9,11 @@ from .const import DOMAIN, SIGNAL_UPDATE
 from .controller import HeatingController, Room
 
 FEELINGS = {"too_hot": ("too hot", "mdi:thermometer-chevron-up"), "too_cold": ("too cold", "mdi:snowflake")}
+NIGHTS = {
+    "too_hot": ("last night too warm", "mdi:weather-night"),
+    "fine": ("last night fine", "mdi:sleep"),
+    "too_cold": ("last night too cold", "mdi:snowflake-thermometer"),
+}
 
 
 async def async_setup_platform(
@@ -23,6 +28,11 @@ async def async_setup_platform(
         for feeling in FEELINGS
     ]
     entities += [ResumeButton(controller, room) for room in controller.rooms.values()]
+    entities += [
+        NightButton(controller, room, answer)
+        for room in controller.rooms.values() if room.bedroom
+        for answer in NIGHTS
+    ]
     async_add_entities(entities)
 
 
@@ -40,6 +50,29 @@ class FeedbackButton(ButtonEntity):
 
     async def async_press(self) -> None:
         await self.controller.async_feedback(self.room, self.feeling)
+
+
+class NightButton(ButtonEntity):
+    """How last night was in a bedroom; the reply shows on the room's target sensor."""
+
+    _attr_should_poll = False
+
+    def __init__(self, controller: HeatingController, room: Room, answer: str) -> None:
+        self.controller = controller
+        self.room = room
+        self.answer = answer
+        label, icon = NIGHTS[answer]
+        self._attr_name = f"{room.name} {label}"
+        self._attr_icon = icon
+        self._attr_unique_id = f"{DOMAIN}_{room.slug}_night_{answer}"
+
+    async def async_press(self) -> None:
+        nights = self.controller.nights
+        if nights is None:
+            await self.controller.async_night_feedback(self.room, self.answer)
+            return
+        user = self._context.user_id if self._context is not None else None
+        await nights.async_answer(self.room.slug, self.answer, person=nights.person_for_user(user))
 
 
 class ResumeButton(ButtonEntity):

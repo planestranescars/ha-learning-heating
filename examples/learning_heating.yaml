@@ -12,6 +12,13 @@ history_days: 10                 # history replayed on first start
 people:                          # optional: ease off when all of them are out
   - person.alex
 energy_price: 0.30               # optional: per kWh, adds a cost to energy sensors
+night_check:                     # optional: ask each morning how the night was
+  at: "09:00"
+  open: /dashboard-sleep         # optional: page the notification opens
+  people:
+    person.alex:
+      notify: notify.mobile_app_alex_phone
+      room: spare_bedroom        # where they usually sleep; they can change it
 
 # Binary sensors that are on while each boiler zone is circulating hot water.
 zones:
@@ -52,6 +59,7 @@ rooms:
     climate: climate.spare_bedroom_trv
     valve: sensor.spare_bedroom_trv_valve
     zone: annexe
+    bedroom: true                  # gets "last night was..." buttons
     occupied: false
     setback: 12
     schedule:

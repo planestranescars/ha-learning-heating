@@ -112,6 +112,18 @@ that takes a target temperature plus a sensor reporting the valve opening.
   set for the schedule as it stands when quiet hours begin, the boost heater is
   switched off, and both are left alone until quiet hours end. Schedule changes that
   fall inside quiet hours wait until they end, so put the bedtime entry before `from`.
+- **How the night was**: mark rooms `bedroom: true` and each gets three buttons, last
+  night too cold / fine / too warm, which can be pressed at any time that day. Too warm
+  after heating that came on while people were asleep (more than 30 minutes before the
+  morning step) makes it come on 30 minutes later; otherwise the night's temperature
+  comes down 0.5 °C. Too cold with the room still short at the morning step makes it
+  warm up 30 minutes earlier; otherwise the night's temperature goes up 0.5 °C. With
+  `night_check`, each person listed is asked on their phone each morning (at `at`, while
+  they are not away) about the bedroom they sleep in, shown and changed with
+  `select.<person>_sleeps_in`, and can answer from the notification. After 4 good nights
+  in a row, or a week of unanswered questions, they are not asked again until a bad
+  night is reported for their room. The same is available as the `night_feedback`
+  service.
 - **Weekday and weekend schedules**: give a room's schedule as two mappings under
   `weekdays` and `weekends`.
 
@@ -149,6 +161,8 @@ last setting).
 - `learning_heating.feedback`: `room`, `feeling` (`too_hot` / `too_cold`), optional
   `when` (any time in the last two days) and optional `nudge` (°C) to also warm or cool
   the room straight away until its next schedule change. Returns what was changed.
+- `learning_heating.night_feedback`: `room`, `feeling` (`too_cold` / `fine` / `too_hot`),
+  optional `person`. How last night was in a bedroom; see "How the night was".
 - `learning_heating.resume`: `room`. Ends a manual change, or a valve switched off by
   hand, and returns the room to its plan straight away.
 - `learning_heating.reset_feedback`: `room`. Forgets that room's feedback adjustments.

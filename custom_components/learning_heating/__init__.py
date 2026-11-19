@@ -14,6 +14,7 @@ from homeassistant.helpers.typing import ConfigType
 
 from .const import DOMAIN
 from .controller import HeatingController
+from .nights import ANSWERS, NightCheck
 from .schedule import validate_schedule
 
 _LOGGER = logging.getLogger(__name__)
@@ -47,6 +48,19 @@ ROOM_SCHEMA = vol.Schema(
         vol.Optional("occupied", default=True): cv.boolean,
         vol.Optional("setback"): vol.Coerce(float),
         vol.Optional("thermostat", default=False): cv.boolean,
+        vol.Optional("bedroom", default=False): cv.boolean,
+    }
+)
+
+NIGHT_SCHEMA = vol.Schema(
+    {
+        vol.Optional("at", default="09:00"): cv.time,
+        vol.Optional("open"): cv.string,
+        vol.Required("people"): {
+            cv.entity_id: vol.Schema(
+                {vol.Required("notify"): cv.string, vol.Optional("room"): cv.slug}
+            )
+        },
     }
 )
 
@@ -63,6 +77,7 @@ CONFIG_SCHEMA = vol.Schema(
                 vol.Optional("people", default=[]): cv.entity_ids,
                 vol.Optional("energy_price"): vol.Coerce(float),
                 vol.Required("rooms"): {cv.slug: ROOM_SCHEMA},
+                vol.Optional("night_check"): NIGHT_SCHEMA,
             }
         )
     },
@@ -85,7 +100,12 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     controller = HeatingController(hass, conf)
     await controller.async_load()
     hass.data[DOMAIN] = controller
-    for platform in (Platform.SENSOR, Platform.SWITCH, Platform.BUTTON, Platform.CLIMATE):
+    if "night_check" in conf:
+        controller.nights = NightCheck(hass, controller, conf["night_check"])
+        await controller.nights.async_load()
+    for platform in (
+        Platform.SENSOR, Platform.SWITCH, Platform.BUTTON, Platform.CLIMATE, Platform.SELECT
+    ):
         hass.async_create_task(discovery.async_load_platform(hass, platform, DOMAIN, {}, config))
 
     def room_for(call: ServiceCall):
@@ -100,6 +120,15 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         entry = await controller.async_feedback(
             room_for(call), call.data["feeling"], call.data.get("when"), call.data["nudge"]
         )
+        return entry if call.return_response else None
+
+    async def night_feedback(call: ServiceCall) -> ServiceResponse:
+        room = room_for(call)
+        if controller.nights is not None:
+            person = call.data.get("person") or controller.nights.person_for_user(call.context.user_id)
+            entry = await controller.nights.async_answer(room.slug, call.data["feeling"], person=person)
+        else:
+            entry = await controller.async_night_feedback(room, call.data["feeling"])
         return entry if call.return_response else None
 
     async def reset_feedback(call: ServiceCall) -> None:
@@ -118,8 +147,19 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         }),
         supports_response=SupportsResponse.OPTIONAL,
     )
+    hass.services.async_register(
+        DOMAIN, "night_feedback", night_feedback,
+        schema=vol.Schema({
+            vol.Required("room"): cv.string,
+            vol.Required("feeling"): vol.In(list(ANSWERS)),
+            vol.Optional("person"): cv.entity_id,
+        }),
+        supports_response=SupportsResponse.OPTIONAL,
+    )
     room_schema = vol.Schema({vol.Required("room"): cv.string})
     hass.services.async_register(DOMAIN, "reset_feedback", reset_feedback, schema=room_schema)
     hass.services.async_register(DOMAIN, "resume", resume, schema=room_schema)
     controller.async_start()
+    if controller.nights is not None:
+        controller.nights.async_start()
     return True

@@ -111,6 +111,8 @@ BOOST_GAP = 2.0
 DEFAULT_HEATER_W = 1000.0
 FEEDBACK_LOG_SIZE = 20
 FEEDBACK_MAX_AGE = timedelta(days=2)
+NIGHT_HOUR = 3            # "last night" is judged by the schedule in force at 03:00
+NIGHT_EARLY = timedelta(minutes=30)  # a warm-up begun this long before the morning step ran while asleep
 BAD_STATES = (STATE_UNAVAILABLE, STATE_UNKNOWN)
 REASON_VALVE_OFF = "valve switched off by hand"
 REASON_QUIET = "quiet hours"
@@ -157,6 +159,8 @@ class Room:
         self.name: str = conf["name"]
         self.climate: str = conf["climate"]
         self.sensor: str | None = conf.get("sensor")
+        self.bedroom: bool = conf.get("bedroom", False)
+        self.warm_up_started: str | None = None   # when the last warm-up began
         self.valve: str | None = conf.get("valve")
         self.zone: str | None = conf.get("zone")
         self.boost: str | None = conf.get("boost")
@@ -314,7 +318,7 @@ class Room:
             "trial": self.trial, "floors": self.floors, "tried": self.tried,
             "calm_since": self.calm_since, "time_shift": self.time_shift, "timing": self.timing,
             "auto_log": self.auto_log, "cycle_rate": self.cycle_rate,
-            "cycle_coast": self.cycle_coast,
+            "cycle_coast": self.cycle_coast, "warm_up_started": self.warm_up_started,
             "levels": self.levels.as_dict() if self.levels else None,
             "hold": (
                 {"until": self.override_until.isoformat(), "target": self.target}
@@ -335,6 +339,7 @@ class Room:
         self.auto_log = list(data.get("auto_log", []))
         self.cycle_rate = data.get("cycle_rate")
         self.cycle_coast = data.get("cycle_coast")
+        self.warm_up_started = data.get("warm_up_started")
         if self.levels is not None:
             self.levels.load(data.get("levels"))
         # A temperature set by hand outlives a restart.
@@ -385,6 +390,7 @@ class HeatingController:
         self.score_date: str | None = None
         self.cold_yesterday: float | None = None
         self._last_scored: datetime | None = None
+        self.nights: Any = None   # the morning question about last night, if set up
 
     # ---- lifecycle -------------------------------------------------------
 
@@ -1141,6 +1147,7 @@ class HeatingController:
                 watch = room.watch = {
                     "at": room.event_at, "target": room.target, "reached": None, "started": now,
                 }
+                room.warm_up_started = now.isoformat(timespec="minutes")
             if watch["reached"] is None and temp is not None and room.target is not None \
                     and seen is not None and seen > watch["started"] \
                     and temp >= room.target - WARM_REACHED:
@@ -1640,6 +1647,87 @@ class HeatingController:
             entry["reply"] = f"{reply}. Set to {room.target:g}° until {_when(room.override_until)}"
         room.feedback_log = (room.feedback_log + [entry])[-FEEDBACK_LOG_SIZE:]
         _LOGGER.info("%s feedback %s at %s: %s", room.name, feeling, entry["time"], action)
+        await self._async_save()
+        async_dispatcher_send(self.hass, SIGNAL_UPDATE)
+        return entry
+
+    async def async_night_feedback(self, room: Room, feeling: str) -> dict[str, Any]:
+        """Learn from how last night was in a bedroom.
+
+        Too hot after a warm-up that began while people were still asleep means it began
+        too soon, so it starts later; otherwise the room was kept too warm overnight and
+        the night's temperature comes down. Too cold with the room still short when the
+        morning step came means the warm-up began too late; otherwise the night's
+        temperature goes up. "Fine" changes nothing.
+        """
+        now = dt_util.now()
+        local = dt_util.as_local(now)
+        night = local.replace(hour=NIGHT_HOUR, minute=0, second=0, microsecond=0)
+        if local < night:
+            night -= timedelta(days=1)
+        if feeling == "fine":
+            return {"night": night.date().isoformat(), "feeling": feeling, "reply": "Thanks, noted"}
+        period = self._period_at(room, night)
+        if period is None:
+            raise HomeAssistantError(f"{room.name} has no schedule entry for the night")
+        morning = next((at for at, _ in self.timeline(room, night) if at > night), None)
+        started = dt_util.parse_datetime(room.warm_up_started or "")
+        early_start = (
+            morning is not None and started is not None
+            and night - timedelta(hours=6) < started < morning - NIGHT_EARLY
+        )
+        repeat = any(
+            item.get("night") == night.date().isoformat() and item["feeling"] == feeling
+            for item in room.feedback_log
+        )
+        offset = room.comfort.get(period, 0.0)
+        minutes = round(LEAD_STEP_H * 60)
+        if repeat:
+            action = reply = "Already noted for last night"
+        elif feeling == "too_hot" and early_start and room.extra_lead > MIN_EXTRA_LEAD_H:
+            room.extra_lead = max(MIN_EXTRA_LEAD_H, room.extra_lead - LEAD_STEP_H)
+            began = f"{dt_util.as_local(started):%H:%M}"
+            action = f"too warm overnight; warm-up began at {began}: now starts {minutes} min later"
+            reply = f"Noted: the heating came on at {began}; from now on it comes on {minutes} min later"
+        elif feeling == "too_hot":
+            room.comfort[period] = max(-COMFORT_LIMIT, offset - COMFORT_STEP)
+            action = f"too warm overnight: lowered the {period} target by {room.comfort[period] - offset:+.1f}C"
+            reply = f"Noted: this room will be {COMFORT_STEP:g}° cooler at night from now on"
+        else:
+            temp = target = None
+            if morning is not None and morning <= now:
+                temp, target = await self._async_conditions_at(room, morning)
+            if (
+                temp is not None and target is not None and temp < target - BEHIND_TARGET
+                and room.extra_lead < MAX_EXTRA_LEAD_H
+            ):
+                room.extra_lead = min(MAX_EXTRA_LEAD_H, room.extra_lead + LEAD_STEP_H)
+                at = f"{dt_util.as_local(morning):%H:%M}"
+                action = f"too cold overnight; only {temp:.1f}C at {at}: warm-up now starts {minutes} min earlier"
+                reply = f"Noted: it was only {temp:.1f}° at {at}; from now on it warms up {minutes} min earlier"
+            else:
+                room.comfort[period] = min(COMFORT_LIMIT, offset + COMFORT_STEP)
+                action = f"too cold overnight: raised the {period} target by {room.comfort[period] - offset:+.1f}C"
+                reply = f"Noted: this room will be {COMFORT_STEP:g}° warmer at night from now on"
+            if not repeat and room.trial is not None and room.trial["period"] == period:
+                self._end_trial(room, now, failed=True, revert=room.comfort.get(period, 0.0) <= offset)
+                action += "; stopped trying less heat here for a month"
+        if room.comfort.get(period) == 0.0:
+            room.comfort.pop(period)
+        entry = {
+            "pressed": now.isoformat(timespec="seconds"),
+            "reply": reply,
+            "time": night.isoformat(timespec="minutes"),
+            "night": night.date().isoformat(),
+            "feeling": feeling,
+            "period": period,
+            "action": action,
+        }
+        if not repeat:
+            room.calm_since = now.isoformat()
+            room.feedback_log = (room.feedback_log + [entry])[-FEEDBACK_LOG_SIZE:]
+            _LOGGER.info("%s night feedback %s: %s", room.name, feeling, action)
+        await self.async_tick()
         await self._async_save()
         async_dispatcher_send(self.hass, SIGNAL_UPDATE)
         return entry

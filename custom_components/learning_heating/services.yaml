@@ -38,6 +38,35 @@ feedback:
           step: 0.5
           unit_of_measurement: "°C"
 
+night_feedback:
+  name: How last night was
+  description: >-
+    Say how last night was in a bedroom. Too warm after heating that came on while
+    people were asleep makes it come on later; otherwise the night temperature moves
+    by 0.5°C. Too cold with the room still short in the morning makes it warm up earlier.
+  fields:
+    room:
+      name: Room
+      required: true
+      example: spare_bedroom
+      selector:
+        text:
+    feeling:
+      name: Last night was
+      required: true
+      selector:
+        select:
+          options:
+            - too_cold
+            - fine
+            - too_hot
+    person:
+      name: Person
+      description: Who slept there, if not whoever is calling.
+      selector:
+        entity:
+          domain: person
+
 resume:
   name: Resume schedule
   description: >-
