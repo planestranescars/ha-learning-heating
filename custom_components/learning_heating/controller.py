@@ -83,6 +83,7 @@ CYCLE_MIN_HEAT = 8
 SENSOR_STALE = timedelta(minutes=15)
 COAST_DEFAULT = 0.3
 SENSED_BAND = 0.3     # a room with its own sensor heats again this far below target
+SENSED_MIN_HEAT = 5   # ...and needs no longer a minimum spell than this
 COAST_WATCH = timedelta(minutes=30)
 BEHIND_TARGET = 0.5
 REPEAT_PRESS = timedelta(minutes=10)
@@ -114,7 +115,9 @@ REASON_QUIET = "quiet hours"
 HAND_LEARN_REASONS = ("schedule", REASON_QUIET, "manual override")
 
 
-GENTLE_LEVELS = (("low", 24.0), ("low", 26.0), ("medium", 28.0))
+# Measured in a garden office: a high fan gets the heat to the room, a slower one leaves
+# it round the unit; the setting is what limits how hard the unit works.
+GENTLE_SETTINGS = (24.0, 26.0, 28.0)
 
 
 def cycle_levels(cycle: dict[str, Any] | None) -> list[tuple[str, float]]:
@@ -122,7 +125,7 @@ def cycle_levels(cycle: dict[str, Any] | None) -> list[tuple[str, float]]:
     if not cycle:
         return []
     top = (cycle["heat_fan"], float(cycle["heat_target"]))
-    return [level for level in GENTLE_LEVELS if level[1] < top[1]] + [top]
+    return [(top[0], setting) for setting in GENTLE_SETTINGS if setting < top[1]] + [top]
 
 
 def _round_target(value: float) -> float:
@@ -1297,7 +1300,7 @@ class HeatingController:
         self._learn_coast(room, now, temp)
         coast = room.cycle_coast if room.cycle_coast is not None else COAST_DEFAULT
         if phase == "heat":
-            ran = now - room.cycle_since >= timedelta(minutes=CYCLE_MIN_HEAT)
+            ran = now - room.cycle_since >= timedelta(minutes=SENSED_MIN_HEAT)
             if ran and temp + coast >= wanted:
                 self._spell_done(room, now)
                 await self._async_cycle_to(room, "idle", now)
@@ -1351,7 +1354,10 @@ class HeatingController:
         if spell is None or level is None or room.levels is None or room.cycle_since is None:
             return
         minutes = (now - room.cycle_since).total_seconds() / 60
-        note = room.levels.spell_done(self.outdoor, spell["start"], level, minutes, spell["warm_up"])
+        note = room.levels.spell_done(
+            self.outdoor, spell["start"], level, minutes, spell["warm_up"],
+            dt_util.as_local(now).date().isoformat(),
+        )
         if note:
             self._auto_note(room, now, note)
         self._store.async_delay_save(self._data, SAVE_DELAY_S)

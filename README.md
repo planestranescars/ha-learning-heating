@@ -54,13 +54,16 @@ that takes a target temperature plus a sensor reporting the valve opening.
   `rise_after_heat_c`. If the sensor stops reporting for 15 minutes the room falls back
   to fan-only checks.
 - **How hard a heat pump runs is learnt**: a heat pump is most efficient, and a room most
-  even, running gently for long spells. A heat-pump room with a sensor has four outputs,
-  from low fan at 24° up to the configured `heat_fan`/`heat_target`. Each spell starts at
+  even, when asked for no more than the room needs. A heat-pump room with a sensor has
+  four outputs, the configured `heat_fan` at 24°, 26°, 28° and the configured
+  `heat_target` (measured in a garden office: a slower fan left the heat round the unit,
+  and the setting is what limits how hard the unit works). Each spell starts at
   the output learnt for weather like today's (outdoor temperatures in 3 °C bands). If the
   room is not there after 20 minutes the output steps up, and next time in that weather
-  starts higher; if spells keep ending within 12 minutes, next time starts lower. A room
+  starts higher, not going back to the output that failed for a fortnight; if spells keep
+  ending within 12 minutes, next time starts lower. A room
   1.5 °C or more below target, as at the start of a warm-up, gets full output. It heats
-  again 0.3 °C below target. The current and learnt outputs are shown as `output_level`
+  again 0.3 °C below target, and a spell lasts at least 5 minutes. The current and learnt outputs are shown as `output_level`
   and `output_levels_learnt`.
 - **Warm-ups tune themselves**: each warm-up is checked against what happened. A room
   that reached its temperature 45 minutes or more before it was wanted starts 30 minutes
