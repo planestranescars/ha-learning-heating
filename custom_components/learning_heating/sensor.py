@@ -75,6 +75,7 @@ class TargetSensor(_RoomSensor):
             "learnt_timing": room.learner.reliable,
             "comfort_adjustments": dict(room.comfort),
             "extra_preheat_minutes": round(room.extra_lead * 60),
+            "night_floor_c": room.night_floor,
             "gentle_warm_up_c": room.ramp_ahead if room.bedroom and room.zone is not None else None,
             "last_feedback": room.feedback_log[-1]["action"] if room.feedback_log else None,
             "last_auto_change": room.auto_log[-1] if room.auto_log else None,

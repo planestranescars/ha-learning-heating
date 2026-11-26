@@ -111,6 +111,17 @@ AWAY_DROP = 2.0
 STATE_HOME = "home"
 QUIET_PREP = timedelta(minutes=20)
 ROOM_AWAY = timedelta(hours=2)
+# Out for less than this while a room warms up for the next step: carry on, as people
+# out shortly before a room is wanted are usually on their way back.
+SHORT_OUT = timedelta(hours=2)
+# A room turned right down overnight is kept no colder than it can warm up from in
+# max_preheat_hours: a warm-up that needed longer raises that floor, one with an hour to
+# spare lowers it.
+FLOOR_AHEAD = timedelta(hours=12)   # the floor holds only this close to a warmer step
+FLOOR_UP, FLOOR_DOWN = 1.0, 0.5
+FLOOR_BELOW_TARGET = 2.0            # never higher than this below the step it warms up for
+FLOOR_SPARE_H = 1.0
+REASON_FLOOR = "night floor"
 TRIAL_STEP = 0.5
 TRIAL_DAYS = 7
 TRIAL_CALM = timedelta(days=7)
@@ -244,6 +255,7 @@ class Room:
         self.spell: dict[str, Any] | None = None
         self.comfort: dict[str, float] = {}
         self.extra_lead = 0.0
+        self.night_floor: float | None = None   # learnt: kept at least this warm overnight
         self.feedback_log: list[dict[str, Any]] = []
 
     @property
@@ -291,6 +303,8 @@ class Room:
             return f"{self.who + ' out' if self.who else 'Nobody home'} for a while, kept at {temp}"
         if self.reason == "warm outside":
             return f"Mild outside, so eased off to {temp}"
+        if self.reason == REASON_FLOOR:
+            return f"Kept at {temp} overnight, so the morning warm-up fits"
         if self.reason == REASON_QUIET and self.quiet_until:
             return f"Quiet hours: left at {temp} until {_when(self.quiet_until)}"
         if self.reason.startswith("pre-heating") and self.event_at:
@@ -332,6 +346,7 @@ class Room:
     def comfort_as_dict(self) -> dict[str, Any]:
         return {
             "offsets": self.comfort, "extra_lead": self.extra_lead, "log": self.feedback_log,
+            "night_floor": self.night_floor,
             "trial": self.trial, "floors": self.floors, "tried": self.tried,
             "calm_since": self.calm_since, "time_shift": self.time_shift, "timing": self.timing,
             "auto_log": self.auto_log, "cycle_rate": self.cycle_rate,
@@ -348,6 +363,7 @@ class Room:
     def load_comfort(self, data: dict[str, Any]) -> None:
         self.comfort = {k: float(v) for k, v in data.get("offsets", {}).items()}
         self.extra_lead = float(data.get("extra_lead", 0.0))
+        self.night_floor = _float(data.get("night_floor"))
         self.feedback_log = list(data.get("log", []))
         self.trial = data.get("trial")
         self.floors = dict(data.get("floors", {}))
@@ -879,14 +895,20 @@ class HeatingController:
             # Out while warming up for the next step: ease off from that step, as being
             # out after it would, rather than letting the room fall back to the night.
             planned, why = self._plan(room, now, base, upcoming)
-            aim = max(base, planned) if why.startswith("pre-heating") else base
-            target, reason = max(min(base, room.setback), aim - AWAY_DROP), "out"
+            if why.startswith("pre-heating") and out < SHORT_OUT:
+                target, reason = planned, why
+            else:
+                aim = max(base, planned) if why.startswith("pre-heating") else base
+                target, reason = max(min(base, room.setback), aim - AWAY_DROP), "out"
         elif self.warm:
             target, reason = min(base, room.setback), "warm outside"
         elif quiet:
             target, reason = base, REASON_QUIET
         else:
             target, reason = self._plan(room, now, base, upcoming)
+            floor = self._floor_now(room, now, base, upcoming)
+            if reason == "schedule" and floor is not None and floor > target:
+                target, reason = floor, REASON_FLOOR
 
         room.target = _round_target(target)
         room.reason = reason
@@ -1068,6 +1090,45 @@ class HeatingController:
             if room.zone is None and room.power:
                 room.energy += self._heater_output(room)[1] / 1000 * elapsed.total_seconds() / 3600
 
+    def _floor_now(
+        self, room: Room, now: datetime, base: float, upcoming: list[tuple[datetime, float]]
+    ) -> float | None:
+        """The learnt overnight floor, if it applies now: a room down at its setback,
+        within a night of a warmer step."""
+        if room.night_floor is None or room.bedroom or base > room.setback:
+            return None
+        nxt = next(((at, t) for at, t in upcoming if t > base), None)
+        if nxt is None or nxt[0] - now > FLOOR_AHEAD:
+            return None
+        return min(room.night_floor, nxt[1] - FLOOR_BELOW_TARGET)
+
+    def _learn_floor(self, room: Room, now: datetime, watch: dict[str, Any]) -> None:
+        """Keep a room switched off overnight warm enough that its warm-up fits."""
+        start = watch.get("from")
+        if room.bedroom or watch.get("interrupted") or start is None:
+            return
+        if watch.get("base") is None or watch["base"] > room.setback:
+            return
+        reached = watch["reached"]
+        needed = ((reached or watch["at"]) - watch["started"]).total_seconds() / 3600
+        ceiling = watch["target"] - FLOOR_BELOW_TARGET
+        before = room.night_floor
+        if needed > self.max_preheat + 0.25:
+            low = before if before is not None else max(room.setback, math.floor(start * 2) / 2)
+            room.night_floor = min(ceiling, low + FLOOR_UP)
+        elif reached is not None and before is not None and needed < self.max_preheat - FLOOR_SPARE_H:
+            room.night_floor = before - FLOOR_DOWN
+            if room.night_floor <= room.setback:
+                room.night_floor = None
+        if room.night_floor == before:
+            return
+        took = f"{int(needed)} h {round(needed % 1 * 60)} min"
+        if room.night_floor is None:
+            text = f"warming up took only {took}, so it is no longer kept warm overnight"
+        else:
+            text = f"warming up took {took}, so it is now kept at {room.night_floor:g}° overnight"
+        self._auto_note(room, now, text)
+
     def _plan(
         self, room: Room, now: datetime, base: float, upcoming: list[tuple[datetime, float]]
     ) -> tuple[float, str]:
@@ -1185,6 +1246,7 @@ class HeatingController:
             if watch is None or watch["at"] != room.event_at:
                 watch = room.watch = {
                     "at": room.event_at, "target": room.target, "reached": None, "started": now,
+                    "from": temp, "base": self._scheduled_at(room, now),
                 }
                 room.warm_up_started = now.isoformat(timespec="minutes")
             if watch["reached"] is None and temp is not None and room.target is not None \
@@ -1196,6 +1258,13 @@ class HeatingController:
         self, room: Room, now: datetime, watch: dict[str, Any], temp: float | None
     ) -> None:
         if watch["at"] - watch["started"] < MIN_WATCH:
+            return
+        floor = room.night_floor
+        self._learn_floor(room, now, watch)
+        if room.night_floor != floor:
+            # A warmer night changes how long the warm-up needs: learn the lead afresh
+            # from there rather than from what the colder night needed.
+            self._store.async_delay_save(self._data, SAVE_DELAY_S)
             return
         reached = watch["reached"]
         at = watch["at"]

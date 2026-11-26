@@ -27,9 +27,11 @@ that takes a target temperature plus a sensor reporting the valve opening.
 - **Keeps score**: `sensor.heating_cold_room_hours_today` counts the hours rooms in use
   spent more than 1 °C colder than wanted, to weigh against heating run time.
 - **Presence**: list `people` and, once all of them have been out for 20 minutes, rooms
-  ease off by 2 °C (to setback after 12 hours). Out during a warm-up, a room eases off
-  from the temperature it is warming up to, and a warm-up cut short that way does not
-  make the next one start earlier. Normal service resumes the moment anyone
+  ease off by 2 °C (to setback after 12 hours). Out for less than 2 hours during a
+  warm-up, the warm-up carries on: people out shortly before a room is wanted are
+  usually on their way back. Out for longer, the room eases off from the temperature it
+  was warming up to, and a warm-up cut short that way does not make the next one start
+  earlier. Normal service resumes the moment anyone
   is home. `switch.heating_guests_staying` turns this off while untracked people stay.
 - **Comfort feedback**: "too hot" / "too cold" buttons and a service. Too cold while the
   room was still short of its target makes it start earlier. Too hot while the room was
@@ -79,6 +81,11 @@ that takes a target temperature plus a sensor reporting the valve opening.
   temperature 15 minutes or more before it was wanted starts that much later next time;
   one still more than 0.7 °C short starts 30 minutes earlier. Each change
   is reported on the target sensor as `last_auto_change`.
+- **How cold a room may get overnight is learnt**: a room down at its `setback`
+  overnight (not a bedroom) that needed longer than `max_preheat_hours` to warm up is
+  kept 1 °C warmer overnight from then on, for up to 12 hours before the warmer step and
+  never closer than 2 °C to it. A warm-up with an hour to spare lowers that by 0.5 °C,
+  until the room is left to its setback again. Shown as `night_floor_c`.
 - **Schedule times that move**: if a room is turned up, or reported too cold, shortly before
   a warmer step (or turned down shortly before a cooler one) three times running, that
   step moves earlier; the opposite just after a step moves it later. Steps move 15 minutes
