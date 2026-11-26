@@ -189,6 +189,7 @@ class Room:
         self.climate: str = conf["climate"]
         self.sensor: str | None = conf.get("sensor")
         self.bedroom: bool = conf.get("bedroom", False)
+        self.reads_high: dict[str, Any] | None = conf.get("valve_reads_high")
         self.warm_up_started: str | None = None   # when the last warm-up began
         self.last_reply: dict[str, str] | None = None   # the reply to the latest press
         self.ramp_ahead: float = RAMP_AHEAD   # how far above the room a bedroom warm-up sets the valve
@@ -921,22 +922,45 @@ class HeatingController:
             base if reason.startswith("coasting") else room.target
         )
 
+    def _reads_high_now(self, room: Room) -> float:
+        """How far above the room this valve's own thermometer reads, if set for now."""
+        conf = room.reads_high
+        if not conf:
+            return 0.0
+        local = dt_util.as_local(dt_util.now())
+        if conf.get("until") is not None and local.date() > conf["until"]:
+            return 0.0
+        start, end = conf.get("from"), conf.get("to")
+        if start is not None and end is not None:
+            now_t = local.time()
+            inside = start <= now_t < end if start <= end else (now_t >= start or now_t < end)
+            if not inside:
+                return 0.0
+        return float(conf["by"])
+
     def _update_setpoint(self, room: Room, state: State) -> None:
         """What to send the valve: the target, or lower for a valve that won't shut by itself."""
         room.setpoint = room.target
+        step = _float(state.attributes.get("target_temp_step"))
         if room.target is not None:
-            step = _float(state.attributes.get("target_temp_step"))
             room.setpoint = round_to_step(room.target, step)
         temp = _float(state.attributes.get("current_temperature"))
+        high = self._reads_high_now(room)
         if (
             room.bedroom and room.zone is not None and room.target is not None
             and str(room.reason).startswith("pre-heating")
         ):
             now_temp = room.learner.estimate if room.learner.estimate is not None else temp
             if now_temp is not None:
+                now_temp -= high
                 floor = room.wanted if room.wanted is not None else now_temp
                 gentle = min(room.target, max(floor, now_temp + room.ramp_ahead))
                 room.setpoint = round_to_step(gentle, _float(state.attributes.get("target_temp_step")))
+        if high and room.setpoint is not None:
+            # The valve judges by its own reading, so ask it for that much more.
+            room.setpoint = round_to_step(room.setpoint + high, step)
+            room.easing = False
+            return
         correction = room.valve_correction
         if room.target is None or not correction or temp is None:
             room.easing = False

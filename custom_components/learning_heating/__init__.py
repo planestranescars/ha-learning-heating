@@ -49,6 +49,16 @@ ROOM_SCHEMA = vol.Schema(
         vol.Optional("setback"): vol.Coerce(float),
         vol.Optional("thermostat", default=False): cv.boolean,
         vol.Optional("bedroom", default=False): cv.boolean,
+        # A valve whose own thermometer reads this much above the room (warmed by a pipe
+        # beside it, say): it is set that much higher, so it opens when the room needs it.
+        vol.Optional("valve_reads_high"): vol.Schema(
+            {
+                vol.Required("by"): vol.All(vol.Coerce(float), vol.Range(min=0, max=10)),
+                vol.Optional("from"): cv.time,
+                vol.Optional("to"): cv.time,
+                vol.Optional("until"): cv.date,
+            }
+        ),
     }
 )
 

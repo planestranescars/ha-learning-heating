@@ -89,6 +89,11 @@ that takes a target temperature plus a sensor reporting the valve opening.
   kept 1 °C warmer overnight from then on, for up to 12 hours before the warmer step and
   never closer than 2 °C to it. A warm-up with an hour to spare lowers that by 0.5 °C,
   until the room is left to its setback again. Shown as `night_floor_c`.
+- **A valve that reads high**: a valve's own thermometer can be warmed by something
+  beside it, such as a pipe on its way to another radiator, and then never opens. Set
+  `valve_reads_high: {by: 5}` and the valve is asked for that much more, optionally only
+  `from`/`to` certain times and `until` a date (for a trial). A room thermometer
+  (`sensor:`) is the better fix.
 - **Schedule times that move**: if a room is turned up, or reported too cold, shortly before
   a warmer step (or turned down shortly before a cooler one) three times running, that
   step moves earlier; the opposite just after a step moves it later. Steps move 15 minutes
