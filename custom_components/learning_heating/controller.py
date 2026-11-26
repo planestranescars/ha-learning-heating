@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import statistics
 from datetime import datetime, timedelta
 from functools import partial
 from typing import Any
@@ -85,7 +86,16 @@ CYCLE_MIN_HEAT = 8
 SENSOR_STALE = timedelta(hours=6)  # a steady reading is not reported again, so be patient
 COAST_DEFAULT = 0.3
 SENSED_BAND = 0.3     # a room with its own sensor heats again this far below target
-SENSED_MIN_HEAT = 5   # ...and needs no longer a minimum spell than this
+# A heat pump runs worst, and wears most, in its first minutes, and its fan cools the room
+# before the heat comes: a spell lasts at least this long...
+SENSED_MIN_HEAT = 15
+# ...stops no sooner than this far below target, however much rise is still to come, so
+# it always stops warmer than it started...
+SENSED_STOP_EARLY = 0.2
+# ...and stops at once if the room is this far above target, whatever warmed it.
+SENSED_OVER = 0.5
+COAST_SAMPLES = 7     # the rise after the heat stops is the middle of the last few seen
+COAST_CAP = 1.0
 COAST_WATCH = timedelta(minutes=30)
 BEHIND_TARGET = 0.5
 REPEAT_PRESS = timedelta(minutes=10)
@@ -225,6 +235,7 @@ class Room:
         self.cycle_start: tuple[float, float] | None = None
         self.cycle_rate: float | None = None
         self.cycle_coast: float | None = None
+        self.coast_seen: list[float] = []   # recent rises after the heat stopped
         self.coast_watch: tuple[float, datetime, float] | None = None
         self.cycle_lock = asyncio.Lock()
         self.levels = LevelLearner(len(cycle_levels(self.cycle))) if self.cycle else None
@@ -325,6 +336,7 @@ class Room:
             "calm_since": self.calm_since, "time_shift": self.time_shift, "timing": self.timing,
             "auto_log": self.auto_log, "cycle_rate": self.cycle_rate,
             "cycle_coast": self.cycle_coast, "warm_up_started": self.warm_up_started,
+            "coast_seen": self.coast_seen,
             "ramp_ahead": self.ramp_ahead,
             "levels": self.levels.as_dict() if self.levels else None,
             "hold": (
@@ -346,6 +358,10 @@ class Room:
         self.auto_log = list(data.get("auto_log", []))
         self.cycle_rate = data.get("cycle_rate")
         self.cycle_coast = data.get("cycle_coast")
+        self.coast_seen = [float(v) for v in data.get("coast_seen") or []][-COAST_SAMPLES:]
+        if not self.coast_seen and self.cycle_coast is not None:
+            self.coast_seen = [min(COAST_CAP, float(self.cycle_coast))]
+            self.cycle_coast = self.coast_seen[0]
         self.warm_up_started = data.get("warm_up_started")
         self.ramp_ahead = float(data.get("ramp_ahead", RAMP_AHEAD))
         if self.levels is not None:
@@ -860,7 +876,11 @@ class HeatingController:
         elif out is not None and out >= long_away:
             target, reason = min(base, room.setback), "away"
         elif out is not None:
-            target, reason = max(min(base, room.setback), base - AWAY_DROP), "out"
+            # Out while warming up for the next step: ease off from that step, as being
+            # out after it would, rather than letting the room fall back to the night.
+            planned, why = self._plan(room, now, base, upcoming)
+            aim = max(base, planned) if why.startswith("pre-heating") else base
+            target, reason = max(min(base, room.setback), aim - AWAY_DROP), "out"
         elif self.warm:
             target, reason = min(base, room.setback), "warm outside"
         elif quiet:
@@ -1159,6 +1179,8 @@ class HeatingController:
         if room.override_until is not None or not room.occupied:
             room.watch = None
             return
+        if watch is not None and room.reason in ("out", "away"):
+            watch["interrupted"] = True   # eased off while out: a late arrival is not the lead's fault
         if str(room.reason).startswith("pre-heating") and room.event_at is not None:
             if watch is None or watch["at"] != room.event_at:
                 watch = room.watch = {
@@ -1189,6 +1211,7 @@ class HeatingController:
                 )
         elif (
             temp is not None and temp < watch["target"] - LATE_BY and room.extra_lead < MAX_EXTRA_LEAD_H
+            and not watch.get("interrupted")
         ):
             room.extra_lead = min(MAX_EXTRA_LEAD_H, room.extra_lead + LEAD_STEP_H)
             self._auto_note(
@@ -1326,7 +1349,9 @@ class HeatingController:
         """With a thermometer in the room no fan-only checks are needed.
 
         Heat until the room plus the rise still to come after the unit stops reaches the
-        target; that rise is learnt by watching the room after each spell of heat.
+        target; that rise is learnt by watching the room after each spell of heat. Heating
+        starts 0.3 degC below target and never stops more than 0.2 degC below it, so every
+        spell ends warmer than it began, and lasts long enough to be worth starting.
         """
         wanted = room.target
         phase = room.cycle_phase
@@ -1334,8 +1359,13 @@ class HeatingController:
         coast = room.cycle_coast if room.cycle_coast is not None else COAST_DEFAULT
         if phase == "heat":
             ran = now - room.cycle_since >= timedelta(minutes=SENSED_MIN_HEAT)
-            if ran and temp + coast >= wanted:
-                self._spell_done(room, now)
+            over = temp >= wanted + SENSED_OVER
+            if over or (ran and temp + min(coast, SENSED_STOP_EARLY) >= wanted):
+                if ran:
+                    self._spell_done(room, now)
+                else:
+                    # Warmed by something else (people, sun): says nothing about the output.
+                    room.spell = room.cycle_level = None
                 await self._async_cycle_to(room, "idle", now)
                 room.coast_watch = (temp, now, temp)
                 return
@@ -1408,9 +1438,14 @@ class HeatingController:
             room.coast_watch = (at_stop, since, peak)
             return
         room.coast_watch = None
-        seen = max(0.0, min(2.0, peak - at_stop))
-        room.cycle_coast = seen if room.cycle_coast is None else 0.5 * room.cycle_coast + 0.5 * seen
-        self._auto_note(room, now, f"rises {room.cycle_coast:.1f}° after the heat stops")
+        # The middle of the last few, so one jump from something else warming the room
+        # (someone sitting by the sensor, the sun) does not move it.
+        seen = round(max(0.0, min(COAST_CAP, peak - at_stop)), 2)
+        before = room.cycle_coast
+        room.coast_seen = (room.coast_seen + [seen])[-COAST_SAMPLES:]
+        room.cycle_coast = statistics.median(room.coast_seen)
+        if before is None or round(before, 1) != round(room.cycle_coast, 1):
+            self._auto_note(room, now, f"rises {room.cycle_coast:.1f}° after the heat stops")
         self._store.async_delay_save(self._data, SAVE_DELAY_S)
 
     def _heat_length(self, room: Room, now: datetime) -> tuple[float, tuple[float, float] | None]:

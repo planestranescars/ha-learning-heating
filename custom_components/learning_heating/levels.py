@@ -7,8 +7,8 @@ only full output keeps up.
 So each spell starts at the output learnt for weather like today's. If the room is not
 getting there, the output is stepped up during the spell, and next time in such weather
 starts higher; that weather then does not go back to the output that failed for a
-fortnight. If spells at an output keep ending quickly, it was more than needed, and next
-time starts lower. A room far below its target, as at the start of a morning warm-up,
+fortnight. If spells at an output keep reaching the room's temperature quickly, it was
+more than needed, and next time starts lower. A room far below its target, as at the start of a morning warm-up,
 gets full output.
 """
 from __future__ import annotations
@@ -19,10 +19,10 @@ from typing import Any
 BIN_C = 3.0            # outdoor temperatures within 3 degC count as the same weather
 FAR_GAP = 1.5          # this far below target: full output
 STEP_UP_MIN = 20       # minutes at an output without getting there before stepping up
-SHORT_SPELL_MIN = 12   # a spell this short at an output means it was more than needed
+SHORT_SPELL_MIN = 20   # there this soon at an output (spells last at least 15) means more than needed
 SHORT_NEEDED = 2       # short spells in a row before starting lower
 DEFAULT_LEVEL = 1
-VERSION = 2            # what the outputs are; a new set of outputs starts learning afresh
+VERSION = 3            # what the outputs are; a new set of outputs starts learning afresh
 FLOOR_DAYS = 14        # how long an output that failed stays ruled out for that weather
 
 

@@ -27,7 +27,9 @@ that takes a target temperature plus a sensor reporting the valve opening.
 - **Keeps score**: `sensor.heating_cold_room_hours_today` counts the hours rooms in use
   spent more than 1 °C colder than wanted, to weigh against heating run time.
 - **Presence**: list `people` and, once all of them have been out for 20 minutes, rooms
-  ease off by 2 °C (to setback after 12 hours). Normal service resumes the moment anyone
+  ease off by 2 °C (to setback after 12 hours). Out during a warm-up, a room eases off
+  from the temperature it is warming up to, and a warm-up cut short that way does not
+  make the next one start earlier. Normal service resumes the moment anyone
   is home. `switch.heating_guests_staying` turns this off while untracked people stay.
 - **Comfort feedback**: "too hot" / "too cold" buttons and a service. Too cold while the
   room was still short of its target makes it start earlier. Too hot while the room was
@@ -62,9 +64,14 @@ that takes a target temperature plus a sensor reporting the valve opening.
   the output learnt for weather like today's (outdoor temperatures in 3 °C bands). If the
   room is not there after 20 minutes the output steps up, and next time in that weather
   starts higher, not going back to the output that failed for a fortnight; if spells keep
-  ending within 12 minutes, next time starts lower. A room
+  reaching the temperature within 20 minutes, next time starts lower. A room
   1.5 °C or more below target, as at the start of a warm-up, gets full output. It heats
-  again 0.3 °C below target, and a spell lasts at least 5 minutes. The current and learnt outputs are shown as `output_level`
+  again 0.3 °C below target. A spell lasts at least 15 minutes (a heat pump is least
+  efficient in its first minutes, and its fan cools the room before the heat comes), and
+  never stops more than 0.2 °C below target, so it always ends warmer than it began;
+  only a room 0.5 °C over target stops sooner. The rise after the heat stops is the
+  middle of the last seven seen, so a jump from someone sitting by the sensor does not
+  move it. The current and learnt outputs are shown as `output_level`
   and `output_levels_learnt`.
 - **Warm-ups tune themselves**: a warm-up aims to arrive on time rather than early (a
   bedroom warming while people are still asleep wakes them; a little short at the change
