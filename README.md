@@ -79,7 +79,10 @@ that takes a target temperature plus a sensor reporting the valve opening.
   bedroom warming while people are still asleep wakes them; a little short at the change
   does less harm). Each one is checked against what happened. A room that reached its
   temperature 15 minutes or more before it was wanted starts that much later next time;
-  one still more than 0.7 °C short starts 30 minutes earlier. Each change
+  one still more than 0.7 °C short starts 30 minutes earlier, except a bedroom in the
+  morning (only "too cold" from someone who slept there does that). A room that heated
+  all but flat out for the whole warm-up and was barely rising in its last hour can get
+  no warmer in that weather: it starts 30 minutes later, not earlier. Each change
   is reported on the target sensor as `last_auto_change`.
 - **How cold a room may get overnight is learnt**: a room down at its `setback`
   overnight (not a bedroom) that needed longer than `max_preheat_hours` to warm up is

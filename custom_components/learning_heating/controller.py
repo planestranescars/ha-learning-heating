@@ -73,6 +73,10 @@ MIN_LEAD_H = 0.5
 WARM_REACHED = 0.3        # within this of the target counts as having arrived
 EARLY_REACH_H = 0.25      # arriving this early means the warm-up started too soon
 LATE_BY = 0.7             # still this far short at the change means it started too late
+# Heating all but flat out for the whole warm-up, and barely rising in its last hour: the
+# room is as warm as it can get in this weather, and starting earlier only burns fuel.
+FULL_ON = 0.8
+FLAT_RISE = 0.3
 MIN_WATCH = timedelta(minutes=20)
 TIMING_WINDOW_MIN = 90    # a hand change this close to a schedule step says something about it
 TIMING_NEEDED = 3         # consistent signals before a step moves
@@ -1249,6 +1253,12 @@ class HeatingController:
                     "from": temp, "base": self._scheduled_at(room, now),
                 }
                 room.warm_up_started = now.isoformat(timespec="minutes")
+            if room.cycle is None:
+                watch["ticks"] = watch.get("ticks", 0) + 1
+                if self._effective_valve(room) >= FULL_ON:
+                    watch["full"] = watch.get("full", 0) + 1
+                if "hour_before" not in watch and temp is not None and now >= watch["at"] - timedelta(hours=1):
+                    watch["hour_before"] = temp
             if watch["reached"] is None and temp is not None and room.target is not None \
                     and seen is not None and seen > watch["started"] \
                     and temp >= room.target - WARM_REACHED:
@@ -1279,8 +1289,25 @@ class HeatingController:
                     f"so warm-up for that change now starts {round((before - room.extra_lead) * 60)} min later",
                 )
         elif (
+            temp is not None and temp < watch["target"] - LATE_BY
+            and watch.get("ticks", 0) >= 6 and watch.get("full", 0) >= FULL_ON * watch["ticks"]
+            and watch.get("hour_before") is not None and temp - watch["hour_before"] < FLAT_RISE
+        ):
+            if room.extra_lead <= MIN_EXTRA_LEAD_H:
+                return
+            room.extra_lead = max(MIN_EXTRA_LEAD_H, room.extra_lead - LEAD_STEP_H)
+            self._auto_note(
+                room, now,
+                f"it got no warmer than {temp:g}° by {at:%H:%M} with the heating full on, short of "
+                f"{watch['target']:g}°: starting earlier would not help, so it now starts "
+                f"{round(LEAD_STEP_H * 60)} min later",
+            )
+        elif (
             temp is not None and temp < watch["target"] - LATE_BY and room.extra_lead < MAX_EXTRA_LEAD_H
             and not watch.get("interrupted")
+            # A bedroom a little short in the morning is as asked: warming sooner would wake
+            # people. Only "too cold" from someone who slept there makes it start earlier.
+            and not (room.bedroom and dt_util.as_local(at).hour < 12)
         ):
             room.extra_lead = min(MAX_EXTRA_LEAD_H, room.extra_lead + LEAD_STEP_H)
             self._auto_note(
