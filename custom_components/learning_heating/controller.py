@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import re
 import statistics
 from datetime import datetime, timedelta
 from functools import partial
@@ -146,6 +147,13 @@ BAD_STATES = (STATE_UNAVAILABLE, STATE_UNKNOWN)
 REASON_VALVE_OFF = "valve switched off by hand"
 REASON_QUIET = "quiet hours"
 HAND_LEARN_REASONS = ("schedule", REASON_QUIET, "manual override")
+# Turned up by hand while the room is normally left at its minimum: someone using it for
+# once (a rest in the afternoon), not a schedule that is too cold. Learnt only when it
+# happens again on another day within this long.
+ONE_OFF_REPEAT = timedelta(days=7)
+# Electric heaters only holding a room at its minimum are switched off instead, while the
+# room stays warmer than this. The rest of the house keeps it from getting colder.
+PARK_ABOVE = 10.0
 
 
 # Measured in a garden office: a high fan gets the heat to the room, a slower one leaves
@@ -262,6 +270,8 @@ class Room:
         self.extra_lead = 0.0
         self.night_floor: float | None = None   # learnt: kept at least this warm overnight
         self.feedback_log: list[dict[str, Any]] = []
+        self.parked = False      # heaters switched off by us while only the minimum is wanted
+        self.unparking = False
 
     @property
     def summary(self) -> str:
@@ -300,6 +310,9 @@ class Room:
         temp = f"{self.target:g}°"
         if self.override_until is not None:
             return f"Set by hand to {temp} until {_when(self.override_until)}"
+        if self.parked:
+            until = f" until {_when(self.next_change)}" if self.next_change is not None else ""
+            return f"Heaters off{until}: nobody needs it warmer than {temp}"
         if self.reason == "unoccupied":
             return f"Not in use, kept at {temp}"
         if self.reason == "out":
@@ -357,7 +370,7 @@ class Room:
             "auto_log": self.auto_log, "cycle_rate": self.cycle_rate,
             "cycle_coast": self.cycle_coast, "warm_up_started": self.warm_up_started,
             "coast_seen": self.coast_seen,
-            "ramp_ahead": self.ramp_ahead,
+            "ramp_ahead": self.ramp_ahead, "parked": self.parked, "one_off_checked": True,
             "levels": self.levels.as_dict() if self.levels else None,
             "hold": (
                 {"until": self.override_until.isoformat(), "target": self.target}
@@ -365,11 +378,48 @@ class Room:
             ),
         }
 
+    def _forget_one_offs(self) -> None:
+        """Once, on upgrading: undo turn-ups learnt from a single afternoon in a room
+        normally left at its minimum, as they would not be learnt now."""
+        now = dt_util.now()
+        for item in self.feedback_log:
+            if (
+                item.get("feeling") != "too_cold" or item.get("one_off")
+                or not str(item.get("action", "")).startswith("turned up by hand")
+                or item.get("target") is None or float(item["target"]) > self.setback
+            ):
+                continue
+            when = dt_util.parse_datetime(item.get("time") or "")
+            if when is None or now - when > ONE_OFF_REPEAT:
+                continue
+            others = [
+                other for other in self.feedback_log
+                if other is not item and other.get("feeling") == "too_cold"
+                and other.get("period") == item.get("period")
+                and (parsed := dt_util.parse_datetime(other.get("time") or "")) is not None
+                and dt_util.as_local(parsed).date() != dt_util.as_local(when).date()
+                and abs(parsed - when) <= ONE_OFF_REPEAT
+            ]
+            found = re.search(r"target by ([+-]?[\d.]+)C", item["action"])
+            if others or found is None:
+                continue
+            period = item.get("period")
+            offset = self.comfort.get(period, 0.0) - float(found.group(1))
+            if abs(offset) < 0.01:
+                self.comfort.pop(period, None)
+            else:
+                self.comfort[period] = offset
+            item["one_off"] = True
+            item["action"] += " (since taken as a one-off: undone)"
+
     def load_comfort(self, data: dict[str, Any]) -> None:
         self.comfort = {k: float(v) for k, v in data.get("offsets", {}).items()}
         self.extra_lead = float(data.get("extra_lead", 0.0))
         self.night_floor = _float(data.get("night_floor"))
         self.feedback_log = list(data.get("log", []))
+        self.parked = bool(data.get("parked"))
+        if not data.get("one_off_checked"):
+            self._forget_one_offs()
         self.trial = data.get("trial")
         self.floors = dict(data.get("floors", {}))
         self.tried = dict(data.get("tried", {}))
@@ -737,6 +787,8 @@ class HeatingController:
 
         if old is None or old.state in BAD_STATES:
             return
+        if room.parked and new.state == HVACMode.OFF:
+            return   # a setting on a heater we switched off means nothing
         target = _float(new.attributes.get(ATTR_TEMPERATURE))
         if target is None or target == _float(old.attributes.get(ATTR_TEMPERATURE)):
             return
@@ -1065,6 +1117,29 @@ class HeatingController:
             for item in room.feedback_log
         ):
             return
+        base = scheduled - room.comfort.get(period, 0.0)
+        if gap > 0 and base <= room.setback and not self._turned_up_before(room, period, now):
+            entry = {
+                "pressed": now.isoformat(timespec="seconds"),
+                "reply": (
+                    "Noted as a one-off: this room is normally left at its minimum now, so "
+                    "it only learns from this if it happens again on another day"
+                ),
+                "time": now.isoformat(timespec="minutes"),
+                "feeling": feeling,
+                "temperature": room.learner.last_temp,
+                "target": scheduled,
+                "period": period,
+                "one_off": True,
+                "action": (
+                    f"turned up by hand to {target:g}C while normally at its minimum: "
+                    "a one-off, learnt only if it happens again another day"
+                ),
+            }
+            room.feedback_log = (room.feedback_log + [entry])[-FEEDBACK_LOG_SIZE:]
+            self._store.async_delay_save(self._data, SAVE_DELAY_S)
+            _LOGGER.info("%s: %s", room.name, entry["action"])
+            return
         step = math.copysign(min(MAX_FEEDBACK_JUMP, round(abs(gap) * 2) / 2), gap)
         offset = room.comfort.get(period, 0.0)
         new = max(-COMFORT_LIMIT, min(COMFORT_LIMIT, offset + step))
@@ -1094,6 +1169,17 @@ class HeatingController:
         room.feedback_log = (room.feedback_log + [entry])[-FEEDBACK_LOG_SIZE:]
         self._store.async_delay_save(self._data, SAVE_DELAY_S)
         _LOGGER.info("%s: %s", room.name, entry["action"])
+
+    def _turned_up_before(self, room: Room, period: str, now: datetime) -> bool:
+        """Turned up (or said too cold) at this part of the day on another recent day?"""
+        today = dt_util.as_local(now).date()
+        for item in room.feedback_log:
+            if item.get("feeling") != "too_cold" or item.get("period") != period:
+                continue
+            when = dt_util.parse_datetime(item.get("time") or "")
+            if when is not None and dt_util.as_local(when).date() != today and now - when <= ONE_OFF_REPEAT:
+                return True
+        return False
 
     def _score(self, now: datetime) -> None:
         """Count the hours each room in use spent more than a degree colder than wanted."""
@@ -1351,6 +1437,24 @@ class HeatingController:
             return
         resume = room.resume_requested
         room.resume_requested = False
+        if room.parked and state.state != HVACMode.OFF:
+            room.parked = False
+            if not room.unparking and not resume:
+                # Switched back on by hand: hold what it was set to until the next change.
+                room.override_until = room.next_change or now + OVERRIDE_FALLBACK
+                room.target = _float(state.attributes.get(ATTR_TEMPERATURE)) or room.target
+                room.reason = "manual override"
+                self._store.async_delay_save(self._data, SAVE_DELAY_S)
+                _LOGGER.info("%s switched back on by hand; holding until %s", room.name, _when(room.override_until))
+                return
+            room.unparking = False
+            self._store.async_delay_save(self._data, SAVE_DELAY_S)
+        if (state.state != HVACMode.OFF or room.parked) and self._park_wanted(room, state, now):
+            if state.state != HVACMode.OFF:
+                await self._async_park(room)
+            return
+        if room.parked and state.state == HVACMode.OFF:
+            room.unparking = resume = True
         if state.state == HVACMode.OFF and not resume:
             room.reason = REASON_VALVE_OFF
             return
@@ -1365,6 +1469,32 @@ class HeatingController:
         if not resume and room.last_write and room.last_write[0] == room.setpoint and now - room.last_write[1] < WRITE_RETRY:
             return
         await self._async_write(room, state, now)
+
+    def _park_wanted(self, room: Room, state: State, now: datetime) -> bool:
+        """Electric heaters with nothing to do but hold the minimum: better off."""
+        if room.zone is not None or not room.power or room.cycle or room.override_until is not None:
+            return False
+        if room.target is None or room.target > room.setback or str(room.reason).startswith("pre-heating"):
+            return False
+        if room.quiet_window(now, QUIET_PREP) is not None:
+            return False   # left as it should be for the quiet hours
+        temp = _float(state.attributes.get("current_temperature"))
+        if temp is None:
+            return False
+        return temp > PARK_ABOVE if room.parked else temp >= room.target
+
+    async def _async_park(self, room: Room) -> None:
+        try:
+            await self.hass.services.async_call(
+                "climate", "set_hvac_mode",
+                {"entity_id": room.climate, "hvac_mode": HVACMode.OFF}, blocking=True,
+            )
+        except HomeAssistantError as err:
+            _LOGGER.warning("Could not switch %s off: %s", room.name, err)
+            return
+        room.parked = True
+        self._store.async_delay_save(self._data, SAVE_DELAY_S)
+        _LOGGER.info("%s: heaters off while only %.1f is wanted", room.name, room.target)
 
     async def _async_cycle(self, room: Room, now: datetime) -> None:
         """Keep a room warm with a heat pump whose own sensor cannot be trusted.

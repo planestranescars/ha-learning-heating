@@ -89,6 +89,14 @@ that takes a target temperature plus a sensor reporting the valve opening.
   kept 1 °C warmer overnight from then on, for up to 12 hours before the warmer step and
   never closer than 2 °C to it. A warm-up with an hour to spare lowers that by 0.5 °C,
   until the room is left to its setback again. Shown as `night_floor_c`.
+- **A one-off turn-up is not learnt**: turned up by hand at a time of day the room is
+  normally left at its `setback` (a rest in a bedroom in the afternoon, say), the room
+  heats as asked until its next schedule change but learns nothing, unless the same
+  happens on another day within a week.
+- **Electric heaters switch off when only the minimum is wanted**: a room of panel heaters
+  (`power:`, no `zone:`) whose target is just its `setback` has them switched off rather
+  than left holding it, while the room stays above 10 °C. They come back on for the next
+  warm-up; switched on by hand, they are left on until the next schedule change.
 - **A valve that reads high**: a valve's own thermometer can be warmed by something
   beside it, such as a pipe on its way to another radiator, and then never opens. Set
   `valve_reads_high: {by: 5}` and the valve is asked for that much more, optionally only
